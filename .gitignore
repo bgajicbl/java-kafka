@@ -1,0 +1,6 @@
+target/
+.idea/
+*.iml
+.DS_Store
+/tmp/kafka-streams-ledger/
+

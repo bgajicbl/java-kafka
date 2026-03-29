@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: kafka-ledger-learning
+  kafka:
+    bootstrap-servers: localhost:9092
+    properties:
+      schema.registry.url: http://localhost:8081
+      request.timeout.ms: 10000
+      default.api.timeout.ms: 30000
+      auto.register.schemas: true
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      acks: all
+      properties:
+        interceptor.classes: com.example.ledger.config.TenantRoutingInterceptor
+    admin:
+      fail-fast: true
+    streams:
+      application-id: kafka-ledger-learning-v1
+      replication-factor: 1
+      properties:
+        processing.guarantee: exactly_once_v2
+        state.dir: /tmp/kafka-streams-ledger
+        num.stream.threads: 2
+        commit.interval.ms: 100
+        # RocksDB production tuning
+        rocksdb.config.setter: com.example.ledger.config.RocksDbConfig
+        # Custom event-time extraction
+        default.timestamp.extractor: com.example.ledger.streams.TransactionEventTimestampExtractor
+        # Error handlers – skip poison pills instead of crashing
+        default.deserialization.exception.handler: com.example.ledger.config.StreamsDeserializationErrorHandler
+        default.production.exception.handler: com.example.ledger.config.StreamsProductionExceptionHandler
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: kafka-ledger-learning
+
+app:
+  ledger:
+    single-transaction-alert-threshold: 10000
+    burst-window-ms: 60000
+    burst-count-threshold: 5

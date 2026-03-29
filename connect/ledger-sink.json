@@ -1,0 +1,12 @@
+{
+  "name": "ledger-balance-sink",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSinkConnector",
+    "tasks.max": "1",
+    "topics": "ledger-balances",
+    "file": "/tmp/ledger-balances.out",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter"
+  }
+}
+

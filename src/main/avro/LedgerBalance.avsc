@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "LedgerBalance",
+  "namespace": "com.example.ledger.avro",
+  "fields": [
+    { "name": "tenantId", "type": "string" },
+    { "name": "accountId", "type": "string" },
+    { "name": "balance", "type": "double" },
+    { "name": "currency", "type": "string" },
+    { "name": "lastEventTime", "type": "long" }
+  ]
+}
+

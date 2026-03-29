@@ -1,0 +1,15 @@
+{
+  "type": "record",
+  "name": "TenantRevenue",
+  "namespace": "com.example.ledger.avro",
+  "doc": "Windowed aggregate of revenue per tenant for tumbling-window analytics",
+  "fields": [
+    { "name": "tenantId", "type": "string" },
+    { "name": "windowStart", "type": "long" },
+    { "name": "windowEnd", "type": "long" },
+    { "name": "totalAmount", "type": "double" },
+    { "name": "transactionCount", "type": "long" },
+    { "name": "currency", "type": "string", "default": "USD" }
+  ]
+}
+

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- ── Default (local dev) profile: human-readable console output ── -->
+    <springProfile name="default">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <!-- ── K8s / prod profile: JSON structured logging for log aggregation ── -->
+    <springProfile name="k8s,prod">
+        <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="ch.qos.logback.classic.encoder.JsonEncoder"/>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON"/>
+        </root>
+    </springProfile>
+
+    <!-- Kafka Streams internal logging (reduce noise) -->
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="io.confluent" level="WARN"/>
+    <logger name="org.rocksdb" level="WARN"/>
+
+    <!-- Application-level logging -->
+    <logger name="com.example.ledger" level="DEBUG"/>
+</configuration>
+

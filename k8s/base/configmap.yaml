@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-ledger-config
+data:
+  bootstrap-servers: "kafka.kafka.svc.cluster.local:9092"
+  schema-registry-url: "http://schema-registry.kafka.svc.cluster.local:8081"
+  # K8s-specific overrides via application-k8s.yml
+  application-k8s.yml: |
+    spring:
+      kafka:
+        streams:
+          replication-factor: 3
+          properties:
+            num.stream.threads: 4
+            state.dir: /var/kafka-streams
+            rocksdb.config.setter: com.example.ledger.config.RocksDbConfig
+

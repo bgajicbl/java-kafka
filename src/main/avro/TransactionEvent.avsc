@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "TransactionEvent",
+  "namespace": "com.example.ledger.avro",
+  "fields": [
+    { "name": "eventId", "type": "string" },
+    { "name": "tenantId", "type": "string" },
+    { "name": "accountId", "type": "string" },
+    { "name": "amount", "type": "double" },
+    { "name": "direction", "type": {
+      "type": "enum",
+      "name": "TxDirection",
+      "symbols": ["DEBIT", "CREDIT"]
+    }},
+    { "name": "currency", "type": "string", "default": "USD" },
+    { "name": "eventTime", "type": "long" }
+  ]
+}
+

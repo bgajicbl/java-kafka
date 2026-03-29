@@ -1,0 +1,27 @@
+{
+  "name": "sync-runs-postgres-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "plugin.name": "pgoutput",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "user",
+    "database.password": "pwd",
+    "database.dbname": "sync",
+    "topic.prefix": "sync",
+    "table.include.list": "public.sync_runs,public.sync_run_payloads",
+    "slot.name": "sync_runs_slot",
+    "publication.name": "sync_runs_pub",
+    "publication.autocreate.mode": "filtered",
+    "snapshot.mode": "initial",
+    "include.schema.changes": "false",
+    "tombstones.on.delete": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:29092",
+    "schema.history.internal.kafka.topic": "schema-history.sync"
+  }
+}

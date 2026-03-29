@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "FraudAlert",
+  "namespace": "com.example.ledger.avro",
+  "fields": [
+    { "name": "tenantId", "type": "string" },
+    { "name": "accountId", "type": "string" },
+    { "name": "eventId", "type": "string" },
+    { "name": "reason", "type": "string" },
+    { "name": "amount", "type": "double" },
+    { "name": "eventTime", "type": "long" }
+  ]
+}
+
