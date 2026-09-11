@@ -143,18 +143,3 @@ curl "http://localhost:8080/api/sync-runs/$SYNC_ID"
 ```bash
 curl http://localhost:8080/actuator/prometheus | grep -E "ledger|payment|fraud|dlq"
 ```
-
-## Job Description Coverage
-
-- ✅ Stateful streaming with State Stores, RocksDB tuning, interactive queries
-- ✅ Kafka Streams DSL **and** native Processor API (FixedKeyProcessor + Punctuator)
-- ✅ Exactly-Once Semantics (`exactly_once_v2`)
-- ✅ Windowed joins and real-time aggregations (tumbling windows)
-- ✅ Financial logic: real-time ledgering, fraud detection, payment orchestration
-- ✅ Schema Registry + Avro + schema evolution
-- ✅ Kafka Connect (Debezium PostgreSQL CDC)
-- ✅ Multi-tenant SaaS architecture (partitioner, interceptor, key convention)
-- ✅ Dead letter queues and production error handling
-- ✅ Cloud-native: Kubernetes (Kustomize), Terraform, Dockerfile
-- ✅ Observability: Prometheus metrics, structured logging, health probes
-- ✅ Event modeling documentation (`docs/event-catalog.md`)
