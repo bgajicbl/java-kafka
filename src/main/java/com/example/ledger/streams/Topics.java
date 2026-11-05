@@ -6,6 +6,7 @@ public final class Topics {
     public static final String TRANSACTION_EVENTS = "tx-events";
     public static final String LEDGER_BALANCES = "ledger-balances";
     public static final String FRAUD_ALERTS = "fraud-alerts";
+    public static final String LEDGER_DLQ = "ledger-dlq";
 
     // ── CDC (Debezium) ───────────────────────────────────────────────
     public static final String SYNC_RUNS_CDC = "sync.public.sync_runs";
@@ -23,11 +24,13 @@ public final class Topics {
 
     // ── Dead Letter Queues ───────────────────────────────────────────
     public static final String DLQ_DESERIALIZATION = "dlq-deserialization-errors";
-    public static final String DLQ_PROCESSING = "dlq-processing-errors";
 
     // ── State Stores ─────────────────────────────────────────────────
     public static final String BALANCE_STORE = "ledger-balance-store";
     public static final String FRAUD_ACTIVITY_STORE = "fraud-activity-store";
+    public static final String FRAUD_EXPIRY_INDEX_STORE = "fraud-expiry-index-store";
+    public static final String TX_DEDUP_STORE = "tx-dedup-store";
+    public static final String ACCOUNT_CURRENCY_STORE = "account-currency-store";
     public static final String SYNC_RUNS_STORE = "sync-runs-store";
     public static final String SYNC_RUN_PAYLOADS_STORE = "sync-run-payloads-store";
     public static final String SYNC_RUNS_MERGED_STORE = "sync-runs-merged-store";

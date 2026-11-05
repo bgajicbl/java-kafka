@@ -12,19 +12,21 @@ orchestration, fraud detection, multi-tenant SaaS, and cloud-native deployment.
 | **Processor API** | `FraudDetectionProcessor` — `FixedKeyProcessor` + `Punctuator` |
 | **Windowed Joins** | KStream–KStream join matching INITIATED ↔ CAPTURED payments |
 | **Tumbling Windows** | Hourly revenue aggregation per tenant |
+| **Idempotent Ledger** | Repartition by account + windowed `eventId` dedup store; single-currency accounts, mismatches → `ledger-dlq` |
+| **Exact Money** | Avro `decimal(19,4)` / `BigDecimal` end to end, validated at the API boundary |
 | **Payment Orchestration** | Full lifecycle state machine (INITIATE→AUTHORIZE→CAPTURE→SETTLE/REVERSE) with DLQ |
-| **Fraud Detection** | Burst-window + single-amount threshold rules |
+| **Fraud Detection** | Burst-window + single-amount rules; stream-time punctuator evicts idle accounts via an expiry index (no full scans) |
 | **Avro + Schema Registry** | 5 Avro schemas, auto-registration, `SpecificAvroSerde` |
 | **Kafka Connect (Debezium)** | PostgreSQL CDC for `sync_runs` + `sync_run_payloads`, merged via KTable join |
-| **Interactive Queries** | 7 REST endpoints querying RocksDB state stores (KeyValue + WindowStore) |
-| **Multi-Tenant SaaS** | `TenantAwarePartitioner` + `TenantRoutingInterceptor` |
+| **Interactive Queries** | REST endpoints over RocksDB stores (KeyValue + WindowStore), routed to the owning instance via `application.server` metadata |
+| **Multi-Tenant SaaS** | JWT `tenant_id` claim enforced on every read/write (incl. forwarded queries), `tenantId\|subKey` keys with validated IDs, `X-Tenant-Id` header interceptor |
 | **Exactly-Once Semantics** | `exactly_once_v2` processing guarantee |
 | **RocksDB Tuning** | Custom `RocksDBConfigSetter` — 64 MB cache, bloom filters, LZ4, universal compaction |
-| **Error Handling / DLQ** | `DeserializationExceptionHandler`, `ProductionExceptionHandler`, payment-dlq branching |
-| **Prometheus Metrics** | Micrometer + custom business counters |
-| **Kubernetes** | Deployment, HPA, PDB, ServiceMonitor, Kustomize overlays (dev/prod) |
+| **Error Handling / DLQ** | Poison pills → `dlq-deserialization-errors` with diagnostics (FAIL if the DLQ write fails); production errors FAIL; client shutdown → liveness DOWN; business DLQs `payment-dlq`, `ledger-dlq` |
+| **Prometheus Metrics** | Micrometer + business counters (processed, duplicates, transitions by status, alerts by reason, DLQ by topic) |
+| **Kubernetes** | StatefulSet with per-pod state volumes, headless service, standby replicas, damped HPA, PDB, ServiceMonitor, Kustomize overlays |
 | **Terraform** | IaC for all 13 Kafka topics |
-| **Testing** | 17 topology tests with `TopologyTestDriver` |
+| **Testing** | 40 tests: topologies (`TopologyTestDriver`, production event-time extractor), API auth/validation/ack semantics (`@WebMvcTest`), DLQ handler, money rules |
 
 ## Quick Start
 
@@ -32,7 +34,7 @@ orchestration, fraud detection, multi-tenant SaaS, and cloud-native deployment.
 # Start infrastructure
 docker compose up -d
 
-# Build & test (17 tests)
+# Build & test
 mvn clean test
 
 # Run application
@@ -55,11 +57,12 @@ mvn spring-boot:run
 
 ```
 src/main/avro/                      5 Avro schemas
-src/main/java/.../api/              6 REST controllers
-src/main/java/.../config/           9 configuration classes (RocksDB, DLQ, metrics, partitioner)
-src/main/java/.../model/           12 domain records
-src/main/java/.../streams/         13 topology factories + processors + query service
-src/test/java/                      6 test classes (17 tests)
+src/main/java/.../api/              6 REST controllers + RFC 7807 exception handler
+src/main/java/.../config/           9 classes (Streams/topic config, RocksDB, error handlers, metrics, health)
+src/main/java/.../model/           14 domain records + Money/Identifiers rules
+src/main/java/.../security/         JWT resource server + tenant access check
+src/main/java/.../streams/         15 topology factories, processors, query routing
+src/test/java/                      9 test classes (40 tests)
 connect/                            Debezium configs + Postgres init SQL
 k8s/                                Kubernetes manifests (Kustomize base + dev/prod overlays)
 terraform/                          Topic provisioning IaC
@@ -84,6 +87,11 @@ docker-compose.yml                  Full Confluent stack + Postgres
 | Postgres | `localhost:5433` | CDC source database |
 
 ## Try It
+
+> Local `application.yml` sets `app.security.enabled=false` so these curls work without an
+> identity provider. The k8s profile enables JWT auth: every `/api` call then needs
+> `Authorization: Bearer <token>` with a `tenant_id` claim matching the tenant in the request.
+> Writes return `202` only after the broker acknowledges them (`503` + `Retry-After` otherwise).
 
 ### Ledger
 
@@ -117,7 +125,7 @@ done
 curl http://localhost:8080/api/payments/tenant-a/pay-1
 
 # Query hourly revenue (after SETTLE)
-curl "http://localhost:8080/api/revenue/tenant-a?from=0&to=9999999999999"
+curl "http://localhost:8080/api/revenue/tenant-a?currency=USD&from=0&to=9999999999999"
 ```
 
 ### Debezium CDC

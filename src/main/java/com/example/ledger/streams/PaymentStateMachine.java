@@ -148,7 +148,7 @@ public final class PaymentStateMachine {
                 current.paymentId() != null ? current.paymentId() : command.getPaymentId(),
                 current.tenantId() != null ? current.tenantId() : command.getTenantId(),
                 current.accountId() != null ? current.accountId() : command.getAccountId(),
-                current.amount() > 0 ? current.amount() : command.getAmount(),
+                current.paymentId() != null ? current.amount() : command.getAmount(),
                 current.currency(),
                 current.status(),
                 reason,

@@ -4,10 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.example.ledger.avro.PaymentCommandType;
 import com.example.ledger.avro.PaymentEvent;
+import com.example.ledger.config.LedgerMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import com.example.ledger.model.PaymentState;
 import com.example.ledger.serde.JsonSerde;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde;
+import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +33,8 @@ class PaymentTopologyTest {
 
     private static final String MOCK_SCHEMA_REGISTRY = "mock://payment-topology-test";
 
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
     @Test
     void fullLifecycle_initiateToSettle() {
         try (TopologyTestDriver driver = createDriver()) {
@@ -37,10 +42,10 @@ class PaymentTopologyTest {
             TestOutputTopic<String, PaymentState> output = outputTopic(driver, Topics.PAYMENT_EVENTS);
             TestOutputTopic<String, PaymentState> dlq = outputTopic(driver, Topics.PAYMENT_DLQ);
 
-            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", 100.0, PaymentCommandType.INITIATE, 1000L));
-            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", 100.0, PaymentCommandType.AUTHORIZE, 2000L));
-            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", 100.0, PaymentCommandType.CAPTURE, 3000L));
-            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", 100.0, PaymentCommandType.SETTLE, 4000L));
+            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", "100.0", PaymentCommandType.INITIATE, 1000L));
+            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", "100.0", PaymentCommandType.AUTHORIZE, 2000L));
+            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", "100.0", PaymentCommandType.CAPTURE, 3000L));
+            input.pipeInput("key", command("pay-1", "tenant-a", "acct-1", "100.0", PaymentCommandType.SETTLE, 4000L));
 
             List<PaymentState> states = output.readValuesToList();
             assertThat(states).hasSize(4);
@@ -60,9 +65,9 @@ class PaymentTopologyTest {
             TestInputTopic<String, PaymentEvent> input = inputTopic(driver);
             TestOutputTopic<String, PaymentState> output = outputTopic(driver, Topics.PAYMENT_EVENTS);
 
-            input.pipeInput("key", command("pay-2", "tenant-a", "acct-1", 50.0, PaymentCommandType.INITIATE, 1000L));
-            input.pipeInput("key", command("pay-2", "tenant-a", "acct-1", 50.0, PaymentCommandType.AUTHORIZE, 2000L));
-            input.pipeInput("key", command("pay-2", "tenant-a", "acct-1", 50.0, PaymentCommandType.REVERSE, 3000L));
+            input.pipeInput("key", command("pay-2", "tenant-a", "acct-1", "50.0", PaymentCommandType.INITIATE, 1000L));
+            input.pipeInput("key", command("pay-2", "tenant-a", "acct-1", "50.0", PaymentCommandType.AUTHORIZE, 2000L));
+            input.pipeInput("key", command("pay-2", "tenant-a", "acct-1", "50.0", PaymentCommandType.REVERSE, 3000L));
 
             List<PaymentState> states = output.readValuesToList();
             assertThat(states).hasSize(3);
@@ -78,9 +83,9 @@ class PaymentTopologyTest {
             TestOutputTopic<String, PaymentState> output = outputTopic(driver, Topics.PAYMENT_EVENTS);
             TestOutputTopic<String, PaymentState> dlq = outputTopic(driver, Topics.PAYMENT_DLQ);
 
-            input.pipeInput("key", command("pay-3", "tenant-b", "acct-2", 75.0, PaymentCommandType.INITIATE, 1000L));
+            input.pipeInput("key", command("pay-3", "tenant-b", "acct-2", "75.0", PaymentCommandType.INITIATE, 1000L));
             // Invalid: try to SETTLE directly from INITIATED (skipping AUTHORIZE + CAPTURE)
-            input.pipeInput("key", command("pay-3", "tenant-b", "acct-2", 75.0, PaymentCommandType.SETTLE, 2000L));
+            input.pipeInput("key", command("pay-3", "tenant-b", "acct-2", "75.0", PaymentCommandType.SETTLE, 2000L));
 
             List<PaymentState> successes = output.readValuesToList();
             assertThat(successes).hasSize(1);
@@ -89,6 +94,8 @@ class PaymentTopologyTest {
             List<PaymentState> failures = dlq.readValuesToList();
             assertThat(failures).hasSize(1);
             assertThat(failures.get(0).failReason()).contains("Cannot SETTLE");
+            assertThat(meterRegistry.counter("dlq.records", "topic", Topics.PAYMENT_DLQ).count()).isEqualTo(1);
+            assertThat(meterRegistry.counter("payments.state.transitions", "status", "INITIATED").count()).isEqualTo(1);
         }
     }
 
@@ -96,7 +103,7 @@ class PaymentTopologyTest {
 
     private TopologyTestDriver createDriver() {
         StreamsBuilder builder = new StreamsBuilder();
-        PaymentTopologyFactory.build(builder, paymentEventSerde());
+        PaymentTopologyFactory.build(builder, paymentEventSerde(), new LedgerMetrics(meterRegistry));
         Topology topology = builder.build();
 
         Properties props = new Properties();
@@ -132,12 +139,12 @@ class PaymentTopologyTest {
     }
 
     private PaymentEvent command(String paymentId, String tenantId, String accountId,
-                                  double amount, PaymentCommandType type, long eventTime) {
+                                  String amount, PaymentCommandType type, long eventTime) {
         return PaymentEvent.newBuilder()
                 .setPaymentId(paymentId)
                 .setTenantId(tenantId)
                 .setAccountId(accountId)
-                .setAmount(amount)
+                .setAmount(new BigDecimal(amount).setScale(4))
                 .setCurrency("USD")
                 .setCommandType(type)
                 .setCorrelationId(null)

@@ -77,20 +77,25 @@ flowchart LR
 
 - `LedgerTopologyFactory`
   - builds the topology (DSL + Processor API)
+  - repartitions by `tenantId|accountId` and runs the ingress guard
   - performs balance aggregation into a KTable-backed state store
-  - invokes fraud transformer and emits alerts
+  - invokes the fraud processor and emits alerts
+- `TransactionGuardProcessor`
+  - drops replayed `eventId`s (window store, per-account scope)
+  - pins each account's currency; mismatches go to `ledger-dlq`
 - `SyncRunCdcTopologyFactory`
   - consumes Debezium CDC topics for `public.sync_runs` and `public.sync_run_payloads`
   - re-keys child payload events by `sync_run_id`
   - materializes latest parent row and current payload collection
   - emits merged JSON documents to `sync-runs-enriched`
-- `FraudDetectorTransformer`
-  - custom stateful Processor API transformer
+- `FraudDetectionProcessor`
+  - stateful `FixedKeyProcessor` (modern Processor API)
   - tracks per-account event burst window
   - emits `FraudAlert` when threshold rules are met
-- `LedgerQueryService`
+  - evicts idle accounts on stream time via an expiry-index store
+- `LedgerQueryService` + `InteractiveQueryRouter`
   - accesses `KafkaStreams` interactive query API
-  - reads local `ReadOnlyKeyValueStore` instances by store name
+  - answers from the local store or forwards to the instance that owns the key
 - `Topics`
   - central names for topics and stores
 
@@ -98,13 +103,24 @@ flowchart LR
 
 - `KafkaStreamsConfig`
   - enables Kafka Streams with `@EnableKafkaStreams`
-  - configures Avro serdes for `TransactionEvent`, `LedgerBalance`, `FraudAlert`
-  - wires both the ledger/fraud topology and the Debezium CDC merge topology
+  - configures Avro serdes for all five Avro contracts
+  - wires the ledger/fraud, payment, windowed-join, revenue and CDC topologies
+  - sets the uncaught-exception policy (`SHUTDOWN_CLIENT`)
 - `TopicConfig`
   - creates topics at startup via Spring Kafka Admin
   - marks `ledger-balances` and `sync-runs-enriched` as compacted
 - `LedgerStreamProperties`
-  - binds fraud thresholds from `application.yml`
+  - binds fraud thresholds and the dedup window from `application.yml`
+- `LedgerMetrics`, `KafkaStreamsHealthIndicator`
+  - business counters for Prometheus; Streams client state in liveness/readiness
+- `StreamsDeserializationErrorHandler`, `StreamsProductionExceptionHandler`
+  - dead-letter poison pills; fail (never skip) on production errors
+
+### 3.4b Security layer (`src/main/java/com/example/ledger/security`)
+
+- `SecurityConfig` — stateless OAuth2 resource server (JWT); disabled only when
+  `app.security.enabled=false` (local docker-compose)
+- `TenantAccess` — the token's `tenant_id` claim must match the tenant in every request
 
 ### 3.5 Infrastructure integrations
 
@@ -128,32 +144,43 @@ sequenceDiagram
     participant FS as fraud-activity-store (RocksDB)
     participant FT as fraud-alerts topic
 
-    C->>API: POST /api/transactions
+    C->>API: POST /api/transactions (bearer JWT)
+    API->>API: validate body, check tenant_id claim
     API->>K: produce TransactionEvent (Avro)
-    K->>S: consume event
+    K-->>API: broker ack (acks=all)
+    API-->>C: 202 Accepted (503 if not acked)
+    K->>S: consume, repartition by tenant|account
+    S->>S: guard: drop replayed eventId, reject currency mismatch
     S->>BS: aggregate running balance by tenant|account
     S->>BT: emit updated LedgerBalance
     S->>FS: update account activity state
     S->>FT: emit FraudAlert when rule is matched
 ```
 
-### 4.2 Read path: HTTP -> Interactive Query -> local state store
+### 4.2 Read path: HTTP -> Interactive Query -> owning instance's state store
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant API as Ledger/Fraud Query Controller
-    participant QS as LedgerQueryService
+    participant QS as LedgerQueryService / InteractiveQueryRouter
     participant KS as KafkaStreams Runtime
+    participant P as Peer instance (owner)
     participant DB as Local RocksDB Store
 
     C->>API: GET /api/ledger/{tenant}/{account}
+    API->>API: check tenant_id claim
     API->>QS: findBalance(tenant, account)
-    QS->>KS: store(name, QueryableStoreType)
-    KS->>DB: point lookup by key tenant|account
-    DB-->>QS: current materialized value
+    QS->>KS: queryMetadataForKey(store, tenant|account)
+    alt this instance is the active host
+        QS->>DB: point lookup by key tenant|account
+        DB-->>QS: current materialized value
+    else another instance owns the key
+        QS->>P: same GET + Authorization + X-Ledger-IQ-Forwarded
+        P-->>QS: value (answered locally, never re-forwarded)
+    end
     QS-->>API: Optional<BalanceView>
-    API-->>C: 200 with JSON or 404
+    API-->>C: 200 with JSON, 404, or 503 during rebalance
 ```
 
 ### 4.3 Key model and tenant isolation
@@ -165,8 +192,11 @@ This system uses a canonical composite key format:
 Why it matters:
 
 - ensures tenant scoping in all state stores
-- preserves co-location in partitioned processing
+- all events for one account land on one partition (required by the dedup guard and the aggregate)
 - keeps query contract deterministic between topology and API
+- IDs are validated (`[A-Za-z0-9._-]{1,64}`), so no ID can contain `|` and forge another tenant's key
+- partitioning hashes the full key, not `tenantId` alone, to avoid hot partitions for large tenants
+- at the API, the JWT `tenant_id` claim must match the tenant being read or written
 
 ### 4.4 CDC merge path: Postgres -> Debezium -> Kafka Streams -> merged topic
 
@@ -198,10 +228,12 @@ This path demonstrates a common financial-integration pattern:
 
 ### 5.1 Avro contracts
 
-Source of contracts:
+Source of contracts (selection; also `PaymentEvent.avsc`, `TenantRevenue.avsc`):
 - `src/main/avro/TransactionEvent.avsc`
 - `src/main/avro/LedgerBalance.avsc`
 - `src/main/avro/FraudAlert.avsc`
+
+All money fields are Avro `decimal(19,4)` (`BigDecimal` in Java), never floating point.
 
 #### TransactionEvent
 
@@ -210,9 +242,9 @@ Source of contracts:
 | eventId | string | Event identity from producer/API |
 | tenantId | string | Tenant scope |
 | accountId | string | Account scope within tenant |
-| amount | double | Absolute amount from request |
+| amount | decimal(19,4) | Positive amount from request |
 | direction | enum(DEBIT,CREDIT) | Sign behavior in aggregation |
-| currency | string | Currency code, defaults to USD |
+| currency | string | ISO-4217 code, validated; defaults to USD |
 | eventTime | long | Epoch millis event timestamp |
 
 #### LedgerBalance
@@ -221,8 +253,8 @@ Source of contracts:
 |---|---|---|
 | tenantId | string | Tenant of the account |
 | accountId | string | Account identifier |
-| balance | double | Running signed balance |
-| currency | string | Last observed currency |
+| balance | decimal(19,4) | Running signed balance |
+| currency | string | The account's currency (fixed by its first event) |
 | lastEventTime | long | Last processed event timestamp |
 
 #### FraudAlert
@@ -233,7 +265,7 @@ Source of contracts:
 | accountId | string | Account scope |
 | eventId | string | Triggering event id |
 | reason | string | Rule reason code |
-| amount | double | Triggering event amount |
+| amount | decimal(19,4) | Triggering event amount |
 | eventTime | long | Triggering event timestamp |
 
 ### 5.2 Topics and stores
@@ -242,9 +274,13 @@ Source of contracts:
 |---|---|---:|---|---|---|
 | `tx-events` | Topic | 6 | No | `TransactionIngestController` | Streams topology |
 | `ledger-balances` | Topic | 6 | Yes | Streams aggregation | Downstream consumers / Connect |
-| `fraud-alerts` | Topic | 6 | No | Fraud transformer path | Downstream consumers |
+| `fraud-alerts` | Topic | 6 | No | Fraud processor path | Downstream consumers |
+| `ledger-dlq` | Topic | 3 | No | Ingress guard (currency mismatch) | Operations / triage |
 | `ledger-balance-store` | State store | N/A | N/A | Streams aggregation | Interactive query API |
-| `fraud-activity-store` | State store | N/A | N/A | Fraud transformer | Interactive query API |
+| `tx-dedup-store` | State store (window) | N/A | N/A | Ingress guard | — |
+| `account-currency-store` | State store | N/A | N/A | Ingress guard | — |
+| `fraud-activity-store` | State store | N/A | N/A | Fraud processor | Interactive query API |
+| `fraud-expiry-index-store` | State store | N/A | N/A | Fraud processor | — |
 
 Note: changelog topics for state stores are created automatically by Kafka Streams.
 
@@ -257,10 +293,18 @@ Reference file: `src/main/java/com/example/ledger/streams/LedgerTopologyFactory.
 - Reads `tx-events` as `KStream<String, TransactionEvent>`.
 - Uses `Consumed.with(StringSerde, TransactionEventSerde)`.
 
-### Step B: re-key for tenant/account partitioning
+### Step B: re-key and repartition for tenant/account partitioning
 
 - `selectKey((k, v) -> v.getTenantId() + "|" + v.getAccountId())`
+- `repartition(... withName("tx-by-account"))` — explicit, so the guard in step B2 sees every
+  event for an account on the same task regardless of how producers keyed `tx-events`.
 - This key is reused everywhere else.
+
+### Step B2: ingress guard
+
+- `processValues(() -> new TransactionGuardProcessor(dedupWindow, metrics), ...)`
+- Replayed `eventId`s are dropped; currency mismatches are split off to `ledger-dlq`.
+- Only accepted events reach the aggregate and the fraud processor.
 
 ### Step C: aggregate balances into KTable
 
@@ -270,7 +314,7 @@ Reference file: `src/main/java/com/example/ledger/streams/LedgerTopologyFactory.
   - `CREDIT` -> add absolute amount
 - Materializes to store name `ledger-balance-store`.
 
-Formula used:
+Formula used (exact `BigDecimal` arithmetic at scale 4):
 
 ```text
 newBalance = oldBalance + signedAmount
@@ -283,15 +327,15 @@ signedAmount = -abs(amount) for DEBIT
 - `balances.toStream().to("ledger-balances")`
 - This emits a new balance record for each aggregate update.
 
-### Step E: execute fraud transformer
+### Step E: execute fraud processor
 
-- Invokes `transform(() -> new FraudDetectorTransformer(properties), ..., "fraud-activity-store")`
+- Invokes `processValues(() -> new FraudDetectionProcessor(properties), ..., "fraud-activity-store", "fraud-expiry-index-store")`
 - Updates activity store and emits alert only when a rule matches.
 - Null results are filtered out before writing to `fraud-alerts`.
 
 ## 7. Fraud Logic Internals
 
-Reference file: `src/main/java/com/example/ledger/streams/FraudDetectorTransformer.java`
+Reference file: `src/main/java/com/example/ledger/streams/FraudDetectionProcessor.java`
 
 Rules currently implemented:
 
@@ -311,28 +355,35 @@ State object used:
 
 - `AccountActivity` with fields `eventsInWindow`, `windowStartMs`, `lastEventTime`
 
+State cleanup:
+
+- a `STREAM_TIME` punctuator (every 30 s of event time) evicts accounts idle for more than
+  `2 × burstWindowMs`
+- stream time, because `lastEventTime` is event time — a wall-clock comparison would evict
+  everything when replaying history and nothing while catching up on a backlog
+- `fraud-expiry-index-store` (key `zeroPaddedLastEventTime|accountKey`) lets each punctuation
+  range-scan only expired entries instead of the whole activity store
+
 ## 8. Query Model and Interactive Queries
 
-Reference file: `src/main/java/com/example/ledger/streams/LedgerQueryService.java`
+Reference files: `src/main/java/com/example/ledger/streams/LedgerQueryService.java`,
+`src/main/java/com/example/ledger/streams/InteractiveQueryRouter.java`
 
 Query steps:
 
 1. Build key as `tenantId|accountId`
-2. Resolve running `KafkaStreams` instance from `StreamsBuilderFactoryBean`
-3. Retrieve named store via `StoreQueryParameters`
-4. Execute point lookup with `store.get(key)`
+2. Ask Kafka Streams which instance is the active host for the key (`queryMetadataForKey`)
+3. If it is another instance, forward the HTTP call to it (with the caller's token)
+4. Otherwise retrieve the named local store via `StoreQueryParameters` and `store.get(key)`
 5. Map Avro/internal model into API view object
 
 Important behavior:
 
-- queries read local RocksDB state, not the broker directly
-- if streams runtime is not started, service throws `IllegalStateException`
+- queries read RocksDB state, not the broker directly
+- each instance advertises `application.server`; in k8s that is the pod's stable StatefulSet DNS name
+- a forwarded request is always answered locally (no forwarding loops during rebalances)
+- if the runtime is not running or a store is restoring, the API returns `503` with `Retry-After`
 - if key is absent, controllers return HTTP 404
-
-Current scope limitation:
-
-- this is local-instance interactive query only
-- cross-instance IQ routing is not implemented in this project
 
 ## 9. Kafka Theory (Mapped to This Project)
 
@@ -388,7 +439,9 @@ In this project:
 - stream processing and output writes are transactional
 - this improves consistency for financial data flows
 
-Note: business-level idempotency by `eventId` is not yet implemented.
+EOS does not stop the *same business event* from arriving twice (e.g. a retried POST produces a
+new record). Business-level idempotency is handled separately by the ledger's `eventId`
+de-duplication store.
 
 ## 10. Kafka Streams Theory (Mapped to This Project)
 
@@ -539,8 +592,12 @@ curl -s http://localhost:8080/actuator/metrics
 
 ### Unit and topology tests
 
-- `LedgerTopologyTest` validates deterministic stateful behavior
-- uses mock schema registry URL and `TopologyTestDriver`
+- topology tests (`LedgerTopologyTest`, `PaymentTopologyTest`, `RevenueAggregationTopologyTest`, …)
+  use a mock schema registry, `TopologyTestDriver` and the production event-time extractor; they
+  cover duplicate event IDs, mixed-currency rejection, exact decimal arithmetic, stream-time
+  eviction and business metrics
+- `ApiSecurityAndValidationTest` covers auth (`401`/`403`), validation (`400`) and ack semantics
+  (`202`/`503`); `StreamsDeserializationErrorHandlerTest` covers dead-lettering
 
 ### Integration and manual labs
 
@@ -548,27 +605,26 @@ curl -s http://localhost:8080/actuator/metrics
 
 ### Recommended additions for senior-level coverage
 
-- duplicate event id tests (business idempotency)
 - out-of-order event policy tests
-- mixed currency rejection tests
+- Testcontainers integration test against a real broker (incl. multi-instance IQ routing)
 - recovery time and lag SLO checks
 
 ## 15. Known Boundaries and Upgrade Path
 
 Current boundaries in this repository:
 
-- no event-id dedup store (business idempotency)
-- local-instance interactive query only
+- payment commands are not idempotent (a retried command is rejected to `payment-dlq`)
+- fraud thresholds are a single number across all currencies
 - simple fraud logic and no risk scoring pipeline
-- no production deployment manifests in this repository
+- no CI pipeline or broker-backed integration tests
 
 Suggested upgrade path:
 
-1. implement dedup transformer and idempotency tests
-2. implement distributed IQ routing with host metadata
+1. add idempotency for payment commands (e.g. by `correlationId`)
+2. per-currency fraud thresholds
 3. add richer fraud models (rolling sums, velocity, anomaly)
-4. introduce CI schema compatibility and contract gates
-5. add Kubernetes + Terraform deployment artifacts
+4. introduce CI with schema compatibility and contract gates
+5. Testcontainers integration tests, including cross-instance query routing
 
 ## 16. Practical Navigation
 

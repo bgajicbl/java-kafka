@@ -1,3 +1,7 @@
+# Kafka Streams scales by partition, and every scale event triggers a rebalance plus state
+# migration. So: target the StatefulSet, cap replicas at the input partition count (6 —
+# extra instances would sit idle), scale on CPU only (JVM heap never shrinks, so a memory
+# target blocks scale-down), and damp both directions to avoid rebalance storms.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -5,10 +9,10 @@ metadata:
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
-    kind: Deployment
+    kind: StatefulSet
     name: kafka-ledger-app
   minReplicas: 2
-  maxReplicas: 12
+  maxReplicas: 6
   metrics:
     - type: Resource
       resource:
@@ -16,10 +20,16 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
-
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+    scaleDown:
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 600

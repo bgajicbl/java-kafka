@@ -57,6 +57,15 @@ resource "kafka_topic" "fraud_alerts" {
   }
 }
 
+resource "kafka_topic" "ledger_dlq" {
+  name               = "ledger-dlq"
+  replication_factor = var.replication_factor
+  partitions         = 3
+  config = {
+    "retention.ms" = "2592000000" # 30 days
+  }
+}
+
 # ── Payment Orchestration ─────────────────────────────────────────
 
 resource "kafka_topic" "payment_commands" {
@@ -110,15 +119,6 @@ resource "kafka_topic" "tenant_revenue_hourly" {
 
 resource "kafka_topic" "dlq_deserialization" {
   name               = "dlq-deserialization-errors"
-  replication_factor = var.replication_factor
-  partitions         = 3
-  config = {
-    "retention.ms" = "2592000000"
-  }
-}
-
-resource "kafka_topic" "dlq_processing" {
-  name               = "dlq-processing-errors"
   replication_factor = var.replication_factor
   partitions         = 3
   config = {

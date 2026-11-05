@@ -45,8 +45,8 @@ Complete reference to all learning materials in this project.
 |----------|----------|--------|---------|------|
 | **`docs/advanced-guide.md`** | 10+ hrs | 8 parts | Senior-level deep dive | Staff+ |
 | Part 1: Design Patterns | 1 hr | State stores, Processor API, Multi-tenant, EOS | Understand "why" | All |
-| Part 2: Extensions | 2-3 hrs | Event dedup, balance floor, windowing, schema evolution, quotas | Hands-on learning | Backend+ |
-| Part 3: Multi-Instance IQ | 1 hr | Metadata-aware routing, Redis cache | Distributed queries | Staff+ |
+| Part 2: Extensions | 2-3 hrs | Event dedup (implemented — study it), payment idempotency, balance floor, windowing, schema evolution, quotas | Hands-on learning | Backend+ |
+| Part 3: Multi-Instance IQ | 1 hr | Metadata-aware routing (implemented), Redis cache alternative | Distributed queries | Staff+ |
 | Part 4: RocksDB Tuning | 1-2 hrs | Cache/commit trade-offs, custom config | Performance | Staff+ |
 | Part 5: Failure Scenarios | 1 hr | Rebalancing, EOS during failure | Resilience | Staff+ |
 | Part 6: Cloud Deployment | 2 hrs | K8s manifest, Terraform IaC | Production | Staff+ |
@@ -68,18 +68,28 @@ All implementation examples are in source code:
 ```
 src/main/java/com/example/ledger/
 ├── streams/
-│   ├── LedgerTopologyFactory.java    (Core topology: DSL + Processor API)
-│   ├── FraudDetectorTransformer.java (Processor API example)
-│   ├── LedgerQueryService.java       (Interactive queries)
-│   └── Topics.java                   (Topic constants)
+│   ├── LedgerTopologyFactory.java      (Core topology: DSL + Processor API)
+│   ├── TransactionGuardProcessor.java  (eventId dedup + single-currency guard)
+│   ├── FraudDetectionProcessor.java    (Processor API: rules + stream-time eviction)
+│   ├── Payment*/Revenue*/SyncRun*TopologyFactory.java
+│   ├── LedgerQueryService.java         (Interactive queries)
+│   ├── InteractiveQueryRouter.java     (Routes queries to the owning instance)
+│   └── Topics.java                     (Topic and store constants)
 ├── config/
-│   ├── KafkaStreamsConfig.java       (Streams wiring)
-│   ├── TopicConfig.java              (Topic creation)
-│   └── LedgerStreamProperties.java   (Configuration)
+│   ├── KafkaStreamsConfig.java         (Streams wiring, uncaught-exception policy)
+│   ├── TopicConfig.java                (Topic creation)
+│   ├── LedgerStreamProperties.java     (Configuration)
+│   ├── LedgerMetrics.java              (Business counters)
+│   └── Streams*ExceptionHandler.java   (DLQ / fail-fast error handling)
+├── security/
+│   ├── SecurityConfig.java             (JWT resource server)
+│   └── TenantAccess.java               (tenant_id claim enforcement)
+├── model/
+│   └── Money.java, Identifiers.java    (decimal money + ID validation rules)
 └── api/
-    ├── TransactionIngestController.java
-    ├── LedgerQueryController.java
-    └── FraudQueryController.java
+    ├── TransactionIngestController.java, PaymentController.java
+    ├── *QueryController.java
+    └── ApiExceptionHandler.java        (RFC 7807 errors)
 ```
 
 ## 📊 Learning Paths (Recommended Sequences)
@@ -90,7 +100,7 @@ Day 1: QUICKSTART.md (20 min)
 Day 1-2: Labs 1-3 (2.5 hours) 
 Day 3-4: Labs 4-6 (2 hours)
 Day 5-6: Labs 7-9 (2.5 hours)
-Day 7: Extension: Event deduplication
+Day 7: Study the eventId dedup guard; extend it to payment commands
 ```
 
 **Time investment:** 10-12 hours  
@@ -138,17 +148,17 @@ Week 4: advanced-guide.md Parts 4, 6-8 + Practice interview Q&A
 - `docs/application-architecture-and-kafka-theory.md` - Sections 6-8 and 10.4
 - `docs/testing-playbook.md` - Labs 3-4, 8
 - `docs/advanced-guide.md` - Part 1.1, 3-4
-- Source: `LedgerQueryService.java`
+- Source: `LedgerQueryService.java`, `InteractiveQueryRouter.java`
 
 ### Processor API & Custom Logic
 - `docs/testing-playbook.md` - Lab 3
 - `docs/advanced-guide.md` - Part 1.2, 2.1-2.5
-- Source: `FraudDetectorTransformer.java`
+- Source: `FraudDetectionProcessor.java`, `TransactionGuardProcessor.java`
 
 ### Multi-Tenant SaaS Patterns
 - `docs/testing-playbook.md` - Lab 8
 - `docs/advanced-guide.md` - Part 1.3, 2.5
-- Source: Key format in `LedgerTopologyFactory.java`
+- Source: Key format in `LedgerTopologyFactory.java`, `security/TenantAccess.java`, `model/Identifiers.java`
 
 ### Schema Registry & Evolution
 - `docs/application-architecture-and-kafka-theory.md` - Sections 5 and 12.1
@@ -172,7 +182,8 @@ Week 4: advanced-guide.md Parts 4, 6-8 + Practice interview Q&A
 
 ### Cloud Deployment
 - `docs/advanced-guide.md` - Part 6-7
-- Hands-on: Create K8s manifests and Terraform modules
+- Source: `k8s/` (StatefulSet, headless service, HPA, overlays), `terraform/`
+- Hands-on: Deploy to a local cluster (kind/minikube) and scale the StatefulSet
 
 ### Leadership & Architecture
 - `docs/testing-playbook.md` - Lab 13

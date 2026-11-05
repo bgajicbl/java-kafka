@@ -1,0 +1,102 @@
+# StatefulSet, not Deployment: Kafka Streams instances are stateful.
+#  - Stable pod identity → stable application.server address for interactive-query routing.
+#  - Per-pod PersistentVolume for RocksDB → a restarted pod resumes from its local state
+#    instead of replaying every changelog topic from the beginning.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-ledger-app
+  labels:
+    app: kafka-ledger
+spec:
+  serviceName: kafka-ledger-headless
+  replicas: 3
+  # Streams instances don't depend on each other's startup order
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kafka-ledger
+  template:
+    metadata:
+      labels:
+        app: kafka-ledger
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8080"
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: kafka-ledger
+          image: kafka-ledger-learning:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "k8s"
+            - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+              value: "optional:file:/config/"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Advertised to peers as application.server for interactive-query routing
+            - name: APP_ADVERTISED_HOST
+              value: "$(POD_NAME).kafka-ledger-headless.$(POD_NAMESPACE).svc.cluster.local"
+            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-ledger-config
+                  key: bootstrap-servers
+            - name: SPRING_KAFKA_PROPERTIES_SCHEMA_REGISTRY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-ledger-config
+                  key: schema-registry-url
+          volumeMounts:
+            - name: state-store
+              mountPath: /var/kafka-streams
+            - name: app-config
+              mountPath: /config
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: app-config
+          configMap:
+            name: kafka-ledger-config
+            items:
+              - key: application-k8s.yml
+                path: application-k8s.yml
+  volumeClaimTemplates:
+    - metadata:
+        name: state-store
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

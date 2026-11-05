@@ -18,10 +18,14 @@ import java.util.HashMap;
 import java.util.Map;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse;
 import org.apache.kafka.streams.kstream.KStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.kafka.annotation.EnableKafkaStreams;
+import org.springframework.kafka.config.StreamsBuilderFactoryBeanConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -29,6 +33,22 @@ import org.springframework.context.annotation.Configuration;
 @EnableKafkaStreams
 @EnableConfigurationProperties(LedgerStreamProperties.class)
 public class KafkaStreamsConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(KafkaStreamsConfig.class);
+
+    /**
+     * Any exception escaping a processor (or a {@code FAIL} from the error handlers) shuts the
+     * client down instead of replacing the thread: the failure is almost always deterministic
+     * for a given record, so a replacement thread would hit it again in a tight loop. The
+     * {@code kafkaStreams} health indicator then reports DOWN and Kubernetes restarts the pod.
+     */
+    @Bean
+    public StreamsBuilderFactoryBeanConfigurer uncaughtExceptionPolicy() {
+        return factoryBean -> factoryBean.setStreamsUncaughtExceptionHandler(exception -> {
+            log.error("Stream thread failed; shutting down Kafka Streams client", exception);
+            return StreamThreadExceptionResponse.SHUTDOWN_CLIENT;
+        });
+    }
 
     // ── Avro Serdes ──────────────────────────────────────────────────
 
@@ -72,10 +92,11 @@ public class KafkaStreamsConfig {
     @Bean
     public KStream<String, TransactionEvent> ledgerTopology(StreamsBuilder builder,
                                                             LedgerStreamProperties properties,
+                                                            LedgerMetrics metrics,
                                                             Serde<TransactionEvent> transactionSerde,
                                                             Serde<LedgerBalance> ledgerBalanceSerde,
                                                             Serde<FraudAlert> fraudAlertSerde) {
-        return LedgerTopologyFactory.build(builder, properties, transactionSerde, ledgerBalanceSerde, fraudAlertSerde);
+        return LedgerTopologyFactory.build(builder, properties, metrics, transactionSerde, ledgerBalanceSerde, fraudAlertSerde);
     }
 
     @Bean
@@ -85,8 +106,9 @@ public class KafkaStreamsConfig {
 
     @Bean
     public KStream<String, PaymentState> paymentTopology(StreamsBuilder builder,
-                                                          Serde<PaymentEvent> paymentEventSerde) {
-        return PaymentTopologyFactory.build(builder, paymentEventSerde);
+                                                          Serde<PaymentEvent> paymentEventSerde,
+                                                          LedgerMetrics metrics) {
+        return PaymentTopologyFactory.build(builder, paymentEventSerde, metrics);
     }
 
     @Bean

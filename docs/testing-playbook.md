@@ -230,12 +230,15 @@ curl http://localhost:8080/api/ledger/tenant-eos/acct-1
 ### Expected result
 
 - You should see deterministic processing behavior with transactional stream writes.
-- Note: this project does not yet implement explicit deduplication by `eventId`, so replaying same event ID can still increase business balance if treated as independent events.
+- The balance is `100.0000`, not `300.0000`: the ledger's ingress guard drops replays of the same
+  `eventId` (scoped to `tenantId|accountId`, remembered for `app.ledger.dedup-window`).
+- `curl -s localhost:8080/actuator/prometheus | grep ledger_transactions_duplicates_total` shows `2.0`.
 
 ### Stretch
 
-- Implement event-id dedup state store and compare behavior before/after.
-- Add integration test asserting no double-application for duplicate event IDs.
+- Send the same `eventId` for a *different* account or tenant and confirm it is applied
+  (IDs are scoped per account).
+- Add a Testcontainers integration test asserting no double-application across an app restart.
 
 ---
 
@@ -573,7 +576,7 @@ Track these artifacts to demonstrate senior readiness:
 
 ## 17) Notes and Current Project Boundaries
 
-- `exactly_once_v2` is configured, but business-level deduplication by `eventId` is not yet implemented.
+- `exactly_once_v2` is configured, and business-level deduplication by `eventId` is implemented for ledger transactions (not yet for payment commands).
 - Connect configs are starter examples and currently use file connectors.
 - This project is ideal for local learning and extension into production-grade patterns.
 

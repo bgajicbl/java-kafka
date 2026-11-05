@@ -1,5 +1,7 @@
 package com.example.ledger.model;
 
+import java.math.BigDecimal;
+
 /**
  * Represents the current state of a payment in the orchestration state machine.
  * Stored in a KTable state store (RocksDB) and serialized as JSON.
@@ -18,7 +20,7 @@ public record PaymentState(
         String paymentId,
         String tenantId,
         String accountId,
-        double amount,
+        BigDecimal amount,
         String currency,
         String status,
         String failReason,
@@ -31,7 +33,7 @@ public record PaymentState(
 ) {
     /** Sentinel value for a brand-new payment that has never been seen. */
     public static PaymentState initial() {
-        return new PaymentState(null, null, null, 0, "USD", "UNKNOWN", null,
+        return new PaymentState(null, null, null, Money.ZERO, Money.DEFAULT_CURRENCY, "UNKNOWN", null,
                 0, 0, 0, 0, 0, 0);
     }
 

@@ -7,7 +7,7 @@
     { "name": "accountId", "type": "string" },
     { "name": "eventId", "type": "string" },
     { "name": "reason", "type": "string" },
-    { "name": "amount", "type": "double" },
+    { "name": "amount", "type": { "type": "bytes", "logicalType": "decimal", "precision": 19, "scale": 4 } },
     { "name": "eventTime", "type": "long" }
   ]
 }

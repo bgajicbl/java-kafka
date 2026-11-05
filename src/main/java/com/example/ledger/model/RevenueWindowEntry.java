@@ -1,5 +1,7 @@
 package com.example.ledger.model;
 
+import java.math.BigDecimal;
+
 /**
  * A single entry from a windowed revenue aggregation.
  * Returned by the revenue interactive query endpoint.
@@ -7,7 +9,7 @@ package com.example.ledger.model;
 public record RevenueWindowEntry(
         long windowStart,
         long windowEnd,
-        double totalAmount,
+        BigDecimal totalAmount,
         long transactionCount,
         String currency
 ) {

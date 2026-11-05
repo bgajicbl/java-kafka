@@ -39,6 +39,12 @@ Kafka Ledger Learning platform.
 
 **Fields:** `eventId`, `tenantId`, `accountId`, `amount`, `direction` (DEBIT/CREDIT), `currency`, `eventTime`
 
+All monetary fields on every topic are Avro `decimal(19,4)` (`BigDecimal`), never floating point.
+
+**Processing guarantees:** events are repartitioned by `tenantId|accountId`, then a guard drops
+replays of the same `eventId` within `app.ledger.dedup-window` (default 7 days) and rejects
+events whose currency differs from the account's first event (→ `ledger-dlq`).
+
 ---
 
 ### 2. `ledger-balances` — Ledger Balance Snapshots
@@ -159,7 +165,7 @@ INITIATED ↔ CAPTURED matches within a 10-minute window, with
 | Property       | Value                              |
 |----------------|------------------------------------|
 | Schema         | `TenantRevenue` (Avro)             |
-| Key            | `tenantId`                         |
+| Key            | `tenantId\|currency`               |
 | Partitions     | 6                                  |
 | Cleanup        | delete (90-day retention)          |
 | Producers      | Revenue aggregation topology       |
@@ -183,9 +189,9 @@ INITIATED ↔ CAPTURED matches within a 10-minute window, with
 
 | Topic                         | Purpose                            |
 |-------------------------------|------------------------------------|
-| `dlq-deserialization-errors`  | Poison pills that failed to deserialise |
-| `dlq-processing-errors`       | Records that caused processing exceptions |
+| `dlq-deserialization-errors`  | Poison pills that failed to deserialise — original bytes + `dlq.original.*` / `dlq.error.*` headers |
 | `payment-dlq`                 | Invalid payment state transitions   |
+| `ledger-dlq`                  | Transactions rejected by the ledger guard (`TransactionEvent`; reason in `dlq.reason` header) |
 
 ---
 
@@ -195,8 +201,11 @@ INITIATED ↔ CAPTURED matches within a 10-minute window, with
 |-------------------------|----------------|-------------------------|---------------------------|
 | `ledger-balance-store`  | KeyValue       | `tenantId\|accountId`   | `LedgerBalance` (Avro)    |
 | `fraud-activity-store`  | KeyValue       | `tenantId\|accountId`   | `AccountActivity` (JSON)  |
+| `fraud-expiry-index-store` | KeyValue    | `paddedLastEventTime\|tenantId\|accountId` | account key (String) |
 | `payment-state-store`   | KeyValue       | `tenantId\|paymentId`   | `PaymentState` (JSON)     |
-| `revenue-hourly-store`  | WindowStore    | `tenantId` (windowed)   | `TenantRevenue` (Avro)    |
+| `revenue-hourly-store`  | WindowStore    | `tenantId\|currency` (windowed) | `TenantRevenue` (Avro) |
+| `tx-dedup-store`        | WindowStore    | `tenantId\|accountId\|eventId` | event timestamp (Long) |
+| `account-currency-store`| KeyValue       | `tenantId\|accountId`   | ISO-4217 code (String)    |
 | `sync-runs-store`       | KeyValue       | `sync_run_id`           | `SyncRunRecord` (JSON)    |
 | `sync-run-payloads-store`| KeyValue      | `sync_run_id`           | `SyncRunPayloadAggregate` |
 | `sync-runs-merged-store`| KeyValue       | `sync_run_id`           | `SyncRunMergedRecord`     |
@@ -210,7 +219,7 @@ INITIATED ↔ CAPTURED matches within a 10-minute window, with
 | GET    | `/api/ledger/{tenantId}/{accountId}`    | ledger-balance-store   | Current balance for an account       |
 | GET    | `/api/fraud/{tenantId}/{accountId}`     | fraud-activity-store   | Fraud activity window state          |
 | GET    | `/api/payments/{tenantId}/{paymentId}`  | payment-state-store    | Current payment lifecycle state      |
-| GET    | `/api/revenue/{tenantId}?from=&to=`     | revenue-hourly-store   | Hourly revenue windows in time range |
+| GET    | `/api/revenue/{tenantId}?currency=&from=&to=` | revenue-hourly-store | Hourly revenue windows for one currency |
 | GET    | `/api/sync-runs/{syncRunId}`            | sync-runs-merged-store | CDC-merged sync run with payloads    |
 | POST   | `/api/transactions`                     | —                      | Submit a transaction event           |
 | POST   | `/api/payments`                         | —                      | Submit a payment command             |
@@ -220,8 +229,11 @@ INITIATED ↔ CAPTURED matches within a 10-minute window, with
 ## Key Design Decisions
 
 ### Multi-Tenant Key Convention
-All keys follow `tenantId|subKey` format, enabling the `TenantAwarePartitioner`
-to hash only on `tenantId`, ensuring co-partitioned tenant data.
+All keys follow `tenantId|subKey` format and are hashed with the default partitioner on the
+full key. Hashing on `tenantId` alone was considered and rejected: one large tenant would pin
+a single partition (and a single stream thread), and no downstream consumer needs cross-account
+ordering within a tenant. IDs are validated (`[A-Za-z0-9._-]{1,64}`) so no component can contain
+the `|` delimiter, and tenant isolation is enforced at the API by the JWT `tenant_id` claim.
 
 ### Exactly-Once Semantics (EOS)
 Configured with `processing.guarantee: exactly_once_v2` — the strongest
