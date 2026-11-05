@@ -58,9 +58,9 @@ public final class PaymentWindowedJoinTopologyFactory {
         KStream<String, String> matched = initiated.join(
                 captured,
                 (init, capt) -> String.format(
-                        "{\"paymentId\":\"%s\",\"tenantId\":\"%s\",\"amount\":%.2f,"
+                        "{\"paymentId\":\"%s\",\"tenantId\":\"%s\",\"amount\":%s,"
                                 + "\"initiatedAt\":%d,\"capturedAt\":%d,\"processingTimeMs\":%d}",
-                        init.paymentId(), init.tenantId(), init.amount(),
+                        init.paymentId(), init.tenantId(), init.amount().toPlainString(),
                         init.initiatedAt(), capt.capturedAt(),
                         capt.capturedAt() - init.initiatedAt()
                 ),

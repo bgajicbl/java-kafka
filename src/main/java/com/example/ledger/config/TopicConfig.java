@@ -35,6 +35,14 @@ public class TopicConfig {
     }
 
     @Bean
+    public NewTopic ledgerDlqTopic() {
+        return TopicBuilder.name(Topics.LEDGER_DLQ)
+                .partitions(3)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
     public NewTopic syncRunsCdcTopic() {
         return TopicBuilder.name(Topics.SYNC_RUNS_CDC)
                 .partitions(6)
@@ -109,14 +117,6 @@ public class TopicConfig {
     @Bean
     public NewTopic dlqDeserializationTopic() {
         return TopicBuilder.name(Topics.DLQ_DESERIALIZATION)
-                .partitions(3)
-                .replicas(1)
-                .build();
-    }
-
-    @Bean
-    public NewTopic dlqProcessingTopic() {
-        return TopicBuilder.name(Topics.DLQ_PROCESSING)
                 .partitions(3)
                 .replicas(1)
                 .build();

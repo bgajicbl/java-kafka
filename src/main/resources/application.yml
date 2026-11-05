@@ -14,13 +14,21 @@ spring:
       acks: all
       properties:
         interceptor.classes: com.example.ledger.config.TenantRoutingInterceptor
+        # The API answers 202 only after the broker acks, so bound how long a request can wait:
+        # max.block.ms caps metadata/buffer waits inside send(), delivery.timeout.ms the ack itself
+        max.block.ms: 5000
+        delivery.timeout.ms: 15000
     admin:
       fail-fast: true
     streams:
-      application-id: kafka-ledger-learning-v1
+      # v2: decimal money schemas + repartitioned ledger topology are incompatible with v1 state
+      application-id: kafka-ledger-learning-v2
       replication-factor: 1
       properties:
         processing.guarantee: exactly_once_v2
+        # Host:port other instances use to reach this one for interactive queries.
+        # In k8s this is the pod's stable StatefulSet DNS name (see k8s/base/statefulset.yaml).
+        application.server: ${APP_ADVERTISED_HOST:localhost}:${server.port:8080}
         state.dir: /tmp/kafka-streams-ledger
         num.stream.threads: 2
         commit.interval.ms: 100
@@ -37,12 +45,28 @@ management:
     web:
       exposure:
         include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        # A Streams client in ERROR never recovers on its own → fail liveness so k8s restarts the pod
+        liveness:
+          include: livenessState,kafkaStreams
+        readiness:
+          include: readinessState,kafkaStreams
   metrics:
     tags:
       application: kafka-ledger-learning
 
 app:
+  security:
+    # Local docker-compose only. The k8s profile turns this on and sets the JWT issuer;
+    # with it on, every /api call needs a bearer token whose tenant_id claim matches the tenant.
+    enabled: false
   ledger:
     single-transaction-alert-threshold: 10000
     burst-window-ms: 60000
     burst-count-threshold: 5
+    # Replays of the same eventId within this window are dropped (covers tx-events 7-day retention)
+    dedup-window: 7d

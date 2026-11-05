@@ -5,9 +5,18 @@ metadata:
 data:
   bootstrap-servers: "kafka.kafka.svc.cluster.local:9092"
   schema-registry-url: "http://schema-registry.kafka.svc.cluster.local:8081"
-  # K8s-specific overrides via application-k8s.yml
+  # K8s-specific overrides, mounted at /config/application-k8s.yml (see statefulset.yaml)
   application-k8s.yml: |
+    app:
+      security:
+        enabled: true
     spring:
+      security:
+        oauth2:
+          resourceserver:
+            jwt:
+              # Replace with your identity provider; tokens must carry a tenant_id claim
+              issuer-uri: https://idp.example.com/realms/finance-platform
       kafka:
         streams:
           replication-factor: 3
@@ -15,4 +24,6 @@ data:
             num.stream.threads: 4
             state.dir: /var/kafka-streams
             rocksdb.config.setter: com.example.ledger.config.RocksDbConfig
+            # Warm replica of each store on another pod: fast failover for writes and queries
+            num.standby.replicas: 1
 

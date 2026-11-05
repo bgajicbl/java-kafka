@@ -28,24 +28,29 @@ TransactionEvent ---> [Ledger Aggregation] --> State Store (ledger-balance-store
 
 ---
 
-### 1.2 Processor API Transformer: Fine-Grained Control
+### 1.2 Processor API: Fine-Grained Control
 
 **What we're practicing:** The Processor API gives you **direct access to the processor context** and state stores, enabling sophisticated business logic.
 
-**In this project:**
+**In this project** (modern `FixedKeyProcessor` API via `processValues`; the deprecated `Transformer` API is not used):
 
 ```java
-events.transform(
-  () -> new FraudDetectorTransformer(properties),  // Supplier creates new instance per task
+accepted.processValues(
+  () -> new FraudDetectionProcessor(properties),  // Supplier creates new instance per task
   Named.as("fraud-detector"),
-  Topics.FRAUD_ACTIVITY_STORE  // State store reference
+  Topics.FRAUD_ACTIVITY_STORE, Topics.FRAUD_EXPIRY_INDEX_STORE  // State store references
 )
 ```
 
-**FraudDetectorTransformer:**
-- Reads and updates `fraud-activity-store` directly inside `transform()`.
+**FraudDetectionProcessor:**
+- Reads and updates `fraud-activity-store` directly inside `process()`.
 - Implements windowed burst detection (resets window on expiration).
-- Returns `null` for non-fraudulent events (filters them out implicitly).
+- Forwards a `FraudAlert` only when a rule fires; otherwise forwards nothing.
+- Schedules a **stream-time** punctuator that evicts idle accounts using a secondary
+  expiry-index store, so cleanup range-scans only expired entries instead of every account.
+
+The same API powers `TransactionGuardProcessor`, which de-duplicates `eventId`s with a window
+store and enforces single-currency accounts before the balance aggregation.
 
 **Why it matters for the role:**
 - The Processor API is where **Kafka Streams becomes a programming language** for event logic.
@@ -68,7 +73,13 @@ KStream<String, TransactionEvent> events = builder
 **Design:**
 - Every key is scoped: `tenantId|accountId`.
 - All state stores use this key format.
-- Partitioning by tenant ensures co-location (same tenant events go to same partition).
+- IDs are validated (`[A-Za-z0-9._-]{1,64}`) so no ID can contain the `|` delimiter and forge
+  another tenant's key.
+- Keys are partitioned on the **full** composite key. Partitioning by `tenantId` alone was
+  rejected: a large tenant would pin one partition (a hot partition) and nothing needs
+  cross-account ordering within a tenant.
+- At the API, a JWT `tenant_id` claim must match the tenant in every read and write
+  (`security/TenantAccess`); the tenant in a request body is never trusted on its own.
 
 **Why it matters for the role:**
 - Multi-tenant architecture is **core to SaaS** and **a hiring expectation** for this role.
@@ -87,9 +98,13 @@ processing.guarantee: exactly_once_v2
 ```
 
 **What EOS_V2 guarantees:**
-1. No event is processed twice (idempotent offset management).
-2. No event is skipped (offset committed only after state + output are durable).
+1. No input record is processed twice (idempotent offset management).
+2. No input record is skipped (offset committed only after state + output are durable).
 3. All writes to output topics are **transactional** (atomic all-or-nothing).
+
+**What it does not guarantee:** that the *same business event* arrives only once. A client that
+retries a POST produces a second, distinct record. That is why the ledger also de-duplicates on
+`eventId` (see 2.1).
 
 **Why it matters for the role:**
 - For financial systems, "exactly once" is **non-negotiable**. You cannot have duplicate payments or skipped transactions.
@@ -102,27 +117,36 @@ processing.guarantee: exactly_once_v2
 
 ### 2.1 Event Deduplication by ID
 
-**Current state:** The project does NOT deduplicate events by `eventId`. Publishing the same event ID multiple times will process each as independent.
-
-**Why:** This is intentional—you should implement it as an extension exercise.
-
-**Implementation sketch:**
+**Current state:** Implemented for the ledger. `TransactionGuardProcessor` remembers each
+`eventId` (scoped to `tenantId|accountId`) in the `tx-dedup-store` window store for
+`app.ledger.dedup-window` (default 7 days) and drops replays, counting them in
+`ledger_transactions_duplicates_total`.
 
 ```java
-// Add to config
-KStream<String, TransactionEvent> dedupedEvents = events.transform(
-  () -> new DeduplicationTransformer(stateDuration),
-  Named.as("deduplication"),
-  "dedup-store"
-);
+KStream<String, TransactionEvent> events = builder.stream(Topics.TRANSACTION_EVENTS, ...)
+    .selectKey((key, value) -> value.getTenantId() + "|" + value.getAccountId())
+    .repartition(Repartitioned.with(stringSerde, transactionSerde).withName("tx-by-account"));
 
-// DeduplicationTransformer logic:
-// 1. On first eventId, emit event and record in state.
-// 2. On duplicate eventId, suppress (return null).
-// 3. After stateDuration, forget the eventId.
+events.processValues(
+    () -> new TransactionGuardProcessor(dedupWindow, metrics),
+    Named.as("tx-guard"),
+    Topics.TX_DEDUP_STORE, Topics.ACCOUNT_CURRENCY_STORE);
 ```
 
-**Learning goal:** Understand Processor API state store usage and supplier pattern.
+Points worth studying:
+- **Why the explicit `repartition()`:** the guard must see every replay of an event on the same
+  task; deduplicating before the repartition would only work if every producer keyed correctly.
+- **Why a window store:** retention bounds state growth automatically; the window should cover
+  the input topic's retention, since that is how far back a replay can come from.
+- **Why per-account scoping:** tenants choose their own IDs, so the same `eventId` in two tenants
+  is not a duplicate.
+
+**Extension:** Payment commands are not yet idempotent — a retried `INITIATE` is rejected to
+`payment-dlq` as an invalid transition instead of being acknowledged as a no-op. Add a
+`correlationId`-based dedup step in front of `PaymentStateMachine`.
+
+**Learning goal:** Processor API state stores, the co-partitioning requirement, and the
+difference between transport-level (EOS) and business-level idempotency.
 
 ---
 
@@ -190,14 +214,15 @@ Then test:
 
 **Current state:** No rate limiting per tenant.
 
-**Extension:** Add a quota-checking transformer:
+**Extension:** Add a quota-checking processor (same pattern as `TransactionGuardProcessor`):
 
 ```java
-events.transform(
-  () -> new RateLimitingTransformer(quotaStore),
+events.processValues(
+  () -> new RateLimitingProcessor(quotaProperties),
+  Named.as("tenant-quota"),
   "quota-store"
 )
-.filterNot((k, v) -> v == null) // Drop over-quota events
+.filter((k, verdict) -> verdict.accepted()) // route rejected events to a DLQ instead of dropping
 ```
 
 **Learning goal:** Resource governance, backpressure, and fair multi-tenant allocation.
@@ -206,36 +231,40 @@ events.transform(
 
 ## Part 3: Multi-Instance Interactive Query Routing
 
-**Problem:** Current IQ only works on the local instance. In production, you have multiple instances.
+**Problem:** Each instance only holds the store partitions assigned to it. With N instances, a
+local-only lookup misses for roughly (N-1)/N of keys.
 
-**Solution options:**
+### 3.1 Metadata-Aware Routing (Implemented)
 
-### 3.1 Metadata-Aware Routing (Recommended for learning)
+`InteractiveQueryRouter` implements this. Each instance advertises `application.server`, and
+every lookup goes through:
 
 ```java
-@GetMapping("/{tenantId}/{accountId}")
-public BalanceView getBalance(@PathVariable String tenantId, @PathVariable String accountId) {
-  String key = tenantId + "|" + accountId;
-  
-  // Get partition for key
-  int partition = getPartition(key);
-  
-  // Get instance responsible for partition
-  HostInfo hostInfo = getHost(partition);
-  
-  // If local, query local store
-  if (isLocal(hostInfo)) {
-    return queryLocalStore(key);
-  }
-  
-  // Otherwise, redirect to remote instance
-  return restTemplate.getForObject(
-    "http://" + hostInfo.host() + ":" + hostInfo.port() 
-    + "/api/ledger/" + tenantId + "/" + accountId,
-    BalanceView.class
-  );
+public <T> Optional<T> query(String storeName, String key,
+                             Function<UriBuilder, URI> remotePath,
+                             ParameterizedTypeReference<T> responseType,
+                             Supplier<Optional<T>> local) {
+    Optional<HostInfo> owner = remoteOwner(storeName, key);   // queryMetadataForKey(...).activeHost()
+    if (owner.isEmpty()) {
+        return local.get();                                   // this instance owns the key
+    }
+    // forward to the owner with X-Ledger-IQ-Forwarded + the caller's Authorization header
+    ...
 }
 ```
+
+Details worth studying:
+- **Loop prevention:** a forwarded request is always answered locally, so two instances with
+  different views of the assignment during a rebalance cannot bounce a request between them.
+- **Rebalances:** with no active host (or a store still restoring) the API returns `503` with
+  `Retry-After`, not a `500`.
+- **Security:** the caller's token is forwarded, so the owning instance re-applies the same
+  tenant check.
+- **Kubernetes:** `application.server` must be stable, so the app runs as a StatefulSet behind a
+  headless service (see 6.1).
+
+**Exercise:** run two instances locally on different ports with different `state.dir`s and
+`APP_ADVERTISED_HOST=localhost`, then query keys owned by each through either port.
 
 **Learning goal:** Understand Kafka partition assignment, metadata access, and distributed query routing.
 
@@ -303,7 +332,7 @@ When a new instance joins or leaves:
 
 ```bash
 # Watch rebalance duration
-watch 'docker compose exec kafka kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group kafka-ledger-learning-v1 --describe'
+watch 'docker compose exec kafka kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group kafka-ledger-learning-v2 --describe'
 
 # Kill an instance
 pkill -f "spring-boot:run"
@@ -319,60 +348,60 @@ pkill -f "spring-boot:run"
 
 **Extension:** Add monitoring for `transaction-abort-rate` to detect failure scenarios.
 
+### 5.3 What Happens on a Bad Record
+
+The project never drops a record silently (see `comprehensive-reference.md` §14):
+- Undeserialisable input goes to `dlq-deserialization-errors`; if that write fails, the thread fails.
+- A production error or an exception in a processor shuts the Streams client down
+  (`SHUTDOWN_CLIENT`), the `kafkaStreams` health indicator turns liveness `DOWN`, and Kubernetes
+  restarts the pod. A deterministic poison record crash-loops the pod on purpose.
+
+**Exercise:** produce a non-Avro record to `tx-events`, inspect its DLQ headers, and confirm
+processing continues. Then explain when you would prefer `CONTINUE` over `FAIL`.
+
 ---
 
 ## Part 6: Cloud Deployment Patterns
 
-### 6.1 Kubernetes Deployment
+### 6.1 Kubernetes: StatefulSet, Not Deployment
+
+See `k8s/base/statefulset.yaml`. The essential parts:
 
 ```yaml
 apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ledger-app
+kind: StatefulSet
 spec:
-  replicas: 3  # 3 instances for balance
-  selector:
-    matchLabels:
-      app: ledger
+  serviceName: kafka-ledger-headless      # stable per-pod DNS names
+  podManagementPolicy: Parallel
   template:
     spec:
       containers:
-      - name: app
-        image: ledger-learning:latest
-        ports:
-        - containerPort: 8080
-        env:
-        - name: KAFKA_BOOTSTRAP_SERVERS
-          valueFrom:
-            configMapKeyRef:
-              name: kafka-config
-              key: bootstrap-servers
-        livenessProbe:
-          httpGet:
-            path: /actuator/health
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /actuator/health/readiness
-            port: 8080
-          initialDelaySeconds: 20
-          periodSeconds: 5
+        - name: kafka-ledger
+          env:
+            - name: APP_ADVERTISED_HOST     # → application.server for IQ routing
+              value: "$(POD_NAME).kafka-ledger-headless.$(POD_NAMESPACE).svc.cluster.local"
+          volumeMounts:
+            - name: state-store
+              mountPath: /var/kafka-streams
+  volumeClaimTemplates:                     # RocksDB survives pod restarts
+    - metadata:
+        name: state-store
+      spec:
+        accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            cpu: 500m
-            memory: 1Gi
-          limits:
-            cpu: 2
-            memory: 4Gi
+            storage: 10Gi
 ```
 
 **Learning points:**
-- Liveness vs. readiness probes (when should traffic start?).
-- Resource requests/limits for Streams apps (heavy on memory for state stores).
-- Horizontal scaling and rebalancing coordination.
+- **Why StatefulSet:** stable identity for `application.server`, and a persistent volume per pod
+  so a restart resumes from local RocksDB instead of replaying every changelog.
+- **Standby replicas** (`num.standby.replicas: 1` in the mounted `application-k8s.yml`) keep a
+  warm copy of each store on another pod for fast failover.
+- **Probes:** liveness and readiness both include the `kafkaStreams` health indicator; a client in
+  `ERROR` never recovers by itself, so the pod must restart.
+- **Autoscaling:** the HPA caps replicas at the input partition count, scales on CPU only, and
+  moves one pod at a time with long stabilisation windows — every scale event is a rebalance.
 
 ### 6.2 Terraform Infrastructure as Code
 
@@ -416,7 +445,7 @@ resource "aws_eks_node_group" "app_nodes" {
 # Consumer lag (how far behind are we?)
 docker compose exec kafka kafka-consumer-groups.sh \
   --bootstrap-server localhost:9092 \
-  --group kafka-ledger-learning-v1 \
+  --group kafka-ledger-learning-v2 \
   --describe
 
 # Processing rate (events/second)
@@ -424,6 +453,10 @@ curl -s http://localhost:8080/actuator/metrics/kafka.stream.task.produced.record
 
 # State store size (bytes)
 curl -s http://localhost:8080/actuator/metrics/kafka.stream.rocksdb.cache.pinned.usage | jq
+
+# Business counters
+curl -s http://localhost:8080/actuator/prometheus \
+  | grep -E "ledger_transactions_(processed|duplicates)|payments_state_transitions|fraud_alerts_emitted|dlq_records"
 ```
 
 ### 7.2 Alerting Rules
@@ -440,6 +473,14 @@ action: investigate rebalance issues
 Alert: TxnAbortRate
 if transaction_abort_rate > 0.001
 action: investigate EOS compliance, check broker health
+
+Alert: DeadLetters
+if increase(dlq_records_total[10m]) > 0
+action: triage the DLQ topic named in the `topic` tag
+
+Alert: StreamsClientDown
+if kafkaStreams health component is DOWN (pod restarting / crash-looping)
+action: read the failing record's coordinates from the logs before it is retried
 ```
 
 ---
@@ -468,8 +509,8 @@ After completing this guide and the labs, you should be able to answer:
 ## Summary and Next Steps
 
 1. **Complete Labs 1-6** in `testing-playbook.md` (Weeks 1-2).
-2. **Implement 2-3 extensions** from **Part 2** (Dedup, Floor Enforcement, Windowing).
-3. **Set up multi-instance routing** from **Part 3**.
+2. **Implement 2-3 extensions** from **Part 2** (payment-command idempotency, Floor Enforcement, Windowing, Quotas).
+3. **Run two instances locally** and exercise the IQ routing from **Part 3**.
 4. **Measure RocksDB performance** using **Part 4** tuning guide.
 5. **Document an ADR** for your design choices (topology, state, keying, EOS mode).
 6. **Containerize and deploy to K8s** using **Part 6** templates.

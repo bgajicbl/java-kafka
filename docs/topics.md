@@ -1,5 +1,8 @@
 # Topic Design
 
+> Ledger and CDC topics only. The complete list (payments, revenue, DLQs) is in
+> [`event-catalog.md`](event-catalog.md). All money fields are Avro `decimal(19,4)`.
+
 ## Core Topics
 
 - `tx-events`
@@ -7,6 +10,14 @@
   - Value: Avro `TransactionEvent`
   - Partitions: 6
   - Use: Source-of-truth input stream for payment and ledger mutations.
+  - Re-keyed and repartitioned by `tenantId|accountId` inside the app, so the ledger does not
+    depend on producers keying correctly.
+
+- `ledger-dlq`
+  - Key: `tenantId|accountId`
+  - Value: Avro `TransactionEvent` (the rejected event), reason in the `dlq.reason` header
+  - Partitions: 3
+  - Use: transactions rejected by the ledger guard (currency differs from the account's currency).
 
 - `ledger-balances`
   - Key: `tenantId|accountId`
@@ -46,9 +57,19 @@
   - Backing store for account balances per tenant.
   - Queried through interactive queries API.
 
+- `tx-dedup-store` (window store)
+  - Remembers `tenantId|accountId|eventId` for `app.ledger.dedup-window` to drop replays.
+
+- `account-currency-store`
+  - The currency each account was opened with (its first accepted event).
+
 - `fraud-activity-store`
   - Tracks per-account activity windows for burst detection.
-  - Built via Processor API transformer and queried via REST.
+  - Built via the Processor API (`FraudDetectionProcessor`) and queried via REST.
+
+- `fraud-expiry-index-store`
+  - `zeroPaddedLastEventTime|accountKey` index so the stream-time punctuator range-scans only
+    idle accounts.
 
 - `sync-runs-store`
   - Latest materialized `sync_runs` row per `sync_run_id`.

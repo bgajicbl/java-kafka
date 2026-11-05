@@ -57,7 +57,7 @@ membership, state management, and exactly-once guarantees.
   GET  /api/sync-runs/...  │  └─────┬─────┘  └────┬─────┘  └───┬──────┘│
                            │        │              │             │       │
                            │  ══════╪══════════════╪═════════════╪═══   │
-                           │     RocksDB State Stores (7 stores)        │
+                           │     RocksDB State Stores (10 stores)       │
                            └────────┼──────────────┼─────────────┼──────┘
                                     │              │             │
                            ─────────┴──────────────┴─────────────┴──────
@@ -69,8 +69,8 @@ membership, state management, and exactly-once guarantees.
 
 | Flow | Source | Topology | Output Topic | State Store |
 |------|--------|----------|--------------|-------------|
-| Ledger | `tx-events` | `LedgerTopologyFactory` | `ledger-balances` | `ledger-balance-store` |
-| Fraud | `tx-events` | `FraudDetectionProcessor` | `fraud-alerts` | `fraud-activity-store` |
+| Ledger | `tx-events` | `LedgerTopologyFactory` + `TransactionGuardProcessor` | `ledger-balances` / `ledger-dlq` | `ledger-balance-store`, `tx-dedup-store`, `account-currency-store` |
+| Fraud | `tx-events` (accepted only) | `FraudDetectionProcessor` | `fraud-alerts` | `fraud-activity-store`, `fraud-expiry-index-store` |
 | Payment | `payment-commands` | `PaymentTopologyFactory` | `payment-events` / `payment-dlq` | `payment-state-store` |
 | Match | `payment-events` | `PaymentWindowedJoinTopologyFactory` | `payment-matched` | (internal join stores) |
 | Revenue | `payment-events` | `RevenueAggregationTopologyFactory` | `tenant-revenue-hourly` | `revenue-hourly-store` |
@@ -124,6 +124,17 @@ All Avro schemas live in `src/main/avro/` and are compiled to Java by the
 | `PaymentEvent` | `PaymentEvent.avsc` | `paymentId`, `tenantId`, `accountId`, `amount`, `currency`, `commandType` (INITIATE/AUTHORIZE/CAPTURE/SETTLE/REVERSE), `correlationId`, `eventTime` |
 | `TenantRevenue` | `TenantRevenue.avsc` | `tenantId`, `windowStart`, `windowEnd`, `totalAmount`, `transactionCount`, `currency` |
 
+### Money Representation
+
+Every monetary field (`amount`, `balance`, `totalAmount`) is an Avro **`decimal(19,4)`** logical
+type, generated as `java.math.BigDecimal` (`enableDecimalLogicalType` in the Avro plugin). Binary
+floating point cannot represent most decimal fractions (`0.1 + 0.2 ≠ 0.3` in `double`), which is
+unacceptable in a ledger.
+
+`model/Money` is the single place amounts are normalised: exactly 4 fractional digits, at most 19
+significant digits, never rounded (excess precision is a `400`, not a silent rounding), and
+ISO-4217 currency codes validated via `java.util.Currency`.
+
 ### Schema Registry Integration
 
 - **Auto-registration** is enabled (`auto.register.schemas: true`).
@@ -144,23 +155,38 @@ Confluent Schema Registry enforces **backward compatibility** by default:
 
 **File:** `LedgerTopologyFactory.java`
 
-Consumes `TransactionEvent` messages from `tx-events`, re-keys them by
-`tenantId|accountId`, and aggregates a running balance in a KTable
-materialised to the `ledger-balance-store`.
+Consumes `TransactionEvent` messages from `tx-events`, re-keys and explicitly repartitions them
+by `tenantId|accountId`, passes them through an ingress guard, and aggregates a running balance
+in a KTable materialised to the `ledger-balance-store`.
+
+### Ingress Guard (`TransactionGuardProcessor`)
+
+Exactly-once only covers Kafka-internal read-process-write cycles. A client that retries an HTTP
+POST produces a *second, distinct* record, which EOS will faithfully apply twice. The guard runs
+before anything touches a balance:
+
+- **Idempotency** — each `eventId`, scoped to its `tenantId|accountId` key (tenants choose their
+  own IDs), is remembered in a window store (`tx-dedup-store`) for `app.ledger.dedup-window`
+  (default 7 days, matching `tx-events` retention). Replays are dropped and counted.
+- **Single-currency accounts** — the first accepted event pins the account's currency in
+  `account-currency-store`; an event in another currency is routed to `ledger-dlq` with a
+  `dlq.reason` header instead of being summed into the balance.
+
+The explicit `repartition()` matters: the guard must see every event (and every replay) for an
+account on the same task, regardless of how upstream producers keyed `tx-events`.
 
 ### How Balance Is Calculated
 
 ```java
-double signedAmount = event.getDirection() == TxDirection.DEBIT
-        ? -Math.abs(event.getAmount())  // Debits subtract
-        : Math.abs(event.getAmount());  // Credits add
+BigDecimal signedAmount = event.getDirection() == TxDirection.DEBIT
+        ? event.getAmount().abs().negate()   // Debits subtract
+        : event.getAmount().abs();           // Credits add
 
-newBalance = currentBalance + signedAmount;
+newBalance = Money.normalize(currentBalance.add(signedAmount));
 ```
 
-The aggregate is initialised at `balance = 0.0` for each new key. Every event
-updates the balance and writes the new `LedgerBalance` snapshot to both the
-state store and the `ledger-balances` output topic (compacted).
+The aggregate starts at `Money.ZERO` (`0.0000`). Every accepted event writes the new
+`LedgerBalance` snapshot to both the state store and the `ledger-balances` topic (compacted).
 
 ### Topology Diagram
 
@@ -168,20 +194,28 @@ state store and the `ledger-balances` output topic (compacted).
 tx-events (Avro)
     │
     ▼  selectKey → tenantId|accountId
+    ▼  repartition ("tx-by-account")
     │
-    ▼  groupByKey → aggregate(balance + signed amount)
-    │         materialised as → ledger-balance-store (RocksDB)
-    │
-    ▼  toStream
-    │
-    ▼  ledger-balances (Avro, compacted)
+    ▼  processValues(TransactionGuardProcessor)   ── tx-dedup-store, account-currency-store
+    │        │
+    │        ├── duplicate          → dropped (ledger.transactions.duplicates++)
+    │        ├── currency mismatch  → ledger-dlq (TransactionEvent + dlq.reason header)
+    │        └── accepted
+    │               │
+    │               ├── groupByKey → aggregate(balance + signed amount)
+    │               │         materialised as → ledger-balance-store
+    │               │         toStream → ledger-balances (Avro, compacted)
+    │               │
+    │               └── FraudDetectionProcessor → fraud-alerts
 ```
 
-### State Store
+### State Stores
 
 | Store | Type | Key | Value |
 |-------|------|-----|-------|
 | `ledger-balance-store` | Persistent KeyValue | `tenantId\|accountId` | `LedgerBalance` (Avro) |
+| `tx-dedup-store` | Persistent Window | `tenantId\|accountId\|eventId` | event timestamp |
+| `account-currency-store` | Persistent KeyValue | `tenantId\|accountId` | ISO-4217 code |
 
 ---
 
@@ -201,9 +235,6 @@ This project uses the **modern Processor API** (Kafka 3.3+):
 - `FixedKeyProcessorContext` — typed context with `forward()` and `schedule()`
 - Invoked via `KStream.processValues()` in the DSL
 
-The older `Transformer` API (deprecated in Kafka 3.3) is preserved in
-`FraudDetectorTransformer.java` for reference but is no longer used in the topology.
-
 ### Fraud Rules
 
 | Rule | Trigger | Alert Reason |
@@ -212,31 +243,44 @@ The older `Transformer` API (deprecated in Kafka 3.3) is preserved in
 | Burst activity | `≥ 5 events in 60 seconds` | `BURST_ACTIVITY_DETECTED` |
 
 Both thresholds are configurable via `LedgerStreamProperties` (`app.ledger.*`
-in `application.yml`).
+in `application.yml`). The fraud processor only sees events the ingress guard accepted, so
+replayed events cannot inflate the burst count.
 
 ### Punctuator (Scheduled Processing)
 
-A wall-clock `Punctuator` runs every **30 seconds** and iterates the entire
-`fraud-activity-store`. Any entry whose `lastEventTime` is older than
-`2 × burstWindowMs` is evicted — preventing unbounded state growth.
+A **stream-time** `Punctuator` runs every 30 seconds of event time and evicts accounts idle for
+more than `2 × burstWindowMs`, preventing unbounded state growth.
 
 ```java
 context.schedule(
     Duration.ofSeconds(30),
-    PunctuationType.WALL_CLOCK_TIME,
-    this::expireStaleWindows
+    PunctuationType.STREAM_TIME,
+    this::expireIdleAccounts
 );
 ```
+
+Two design choices:
+
+- **Stream time, not wall-clock time.** `lastEventTime` is event time, so the eviction clock must
+  be event time too. Comparing it with the wall clock evicts everything immediately when
+  replaying history (so bursts in replayed data are never detected) and never evicts while
+  processing a backlog.
+- **Expiry index instead of a full scan.** `fraud-expiry-index-store` is keyed by
+  `zeroPaddedLastEventTime|accountKey`. Zero-padding makes lexicographic key order equal numeric
+  time order, so each punctuation range-scans only the expired prefix rather than every account.
+  Each update deletes the account's previous index entry, and `lastEventTime` only moves forward,
+  so out-of-order events cannot shorten an account's lifetime.
 
 ### How It Integrates with the DSL
 
 ```java
-events.<FraudAlert>processValues(
+accepted.<FraudAlert>processValues(
     () -> new FraudDetectionProcessor(properties),
     Named.as("fraud-detector"),
-    Topics.FRAUD_ACTIVITY_STORE
+    Topics.FRAUD_ACTIVITY_STORE, Topics.FRAUD_EXPIRY_INDEX_STORE
 )
 .filter((key, alert) -> alert != null)
+.peek((key, alert) -> metrics.fraudAlert(alert.getReason()))
 .to(Topics.FRAUD_ALERTS, Produced.with(stringSerde, fraudAlertSerde));
 ```
 
@@ -249,6 +293,7 @@ filter and reach the `fraud-alerts` topic.
 | Store | Type | Key | Value |
 |-------|------|-----|-------|
 | `fraud-activity-store` | Persistent KeyValue | `tenantId\|accountId` | `AccountActivity` (JSON) |
+| `fraud-expiry-index-store` | Persistent KeyValue | `paddedLastEventTime\|tenantId\|accountId` | account key |
 
 ---
 
@@ -276,7 +321,7 @@ UNKNOWN ──INITIATE──▶ INITIATED
 
 ### How It Works
 
-1. **REST API** (`POST /api/payments`) receives a `PaymentRequest`, converts it to an Avro `PaymentEvent`, and produces to `payment-commands`.
+1. **REST API** (`POST /api/payments`) validates a `PaymentRequest` (an unknown `commandType` is a `400`), converts it to an Avro `PaymentEvent`, produces to `payment-commands`, and answers `202` once the broker acknowledges the write.
 2. The topology re-keys by `tenantId|paymentId` and uses `groupByKey().aggregate()` with `PaymentStateMachine.transition()` as the aggregation function.
 3. `PaymentStateMachine` is a **pure function** — given `(currentState, command) → newState`. It uses Java 21 `switch` expressions with pattern matching.
 4. **Valid transitions** yield a new state with `failReason = null` → routed to `payment-events`.
@@ -301,7 +346,7 @@ payment-commands (Avro PaymentEvent)
 ```java
 public record PaymentState(
     String paymentId, String tenantId, String accountId,
-    double amount, String currency, String status, String failReason,
+    BigDecimal amount, String currency, String status, String failReason,
     long initiatedAt, long authorizedAt, long capturedAt,
     long settledAt, long reversedAt, long lastEventTime
 )
@@ -346,13 +391,13 @@ payment-events
 
 **File:** `RevenueAggregationTopologyFactory.java`
 
-Computes **hourly revenue per tenant** using tumbling time windows on settled
-payments.
+Computes **hourly revenue per tenant and currency** using tumbling time windows on
+settled payments. Amounts in different currencies are never summed.
 
 ### How It Works
 
 1. Reads from `payment-events`, filters for `status == SETTLED`.
-2. Re-keys by `tenantId`.
+2. Re-keys by `tenantId|currency`.
 3. Applies `TimeWindows.ofSizeWithNoGrace(Duration.ofHours(1))`.
 4. Aggregates `totalAmount` and `transactionCount` within each window.
 5. Materialises into a **WindowStore** (`revenue-hourly-store`).
@@ -361,7 +406,7 @@ payments.
 ```
 payment-events
     │
-    ▼  filter(SETTLED) → selectKey(tenantId)
+    ▼  filter(SETTLED) → selectKey(tenantId|currency)
     │
     ▼  windowedBy(1-hour tumbling) → aggregate(sum, count)
     │     materialised as → revenue-hourly-store (WindowStore)
@@ -371,13 +416,17 @@ payment-events
 
 ### Windowed Interactive Query
 
-The `LedgerQueryService.findHourlyRevenue()` method queries the WindowStore:
+`LedgerQueryService.findHourlyRevenue(tenantId, currency, from, to)` queries the WindowStore.
+The aggregator cannot see its window, so the `windowStart`/`windowEnd` fields of the *stored*
+value are placeholders; query results take the real bounds from the window-store iterator key:
 
 ```java
-ReadOnlyWindowStore<String, TenantRevenue> store = kafkaStreams.store(
-    StoreQueryParameters.fromNameAndType(Topics.REVENUE_STORE, QueryableStoreTypes.windowStore())
-);
-WindowStoreIterator<TenantRevenue> iter = store.fetch(tenantId, fromInstant, toInstant);
+try (WindowStoreIterator<TenantRevenue> iter = store.fetch(revenueKey(tenantId, currency), from, to)) {
+    while (iter.hasNext()) {
+        KeyValue<Long, TenantRevenue> entry = iter.next();   // entry.key = window start
+        results.add(RevenueAggregationTopologyFactory.toWindowEntry(entry.key, entry.value));
+    }
+}
 ```
 
 ---
@@ -419,19 +468,37 @@ Debezium Connector (Kafka Connect)
 
 ## 10. Interactive Queries & REST API
 
-**File:** `LedgerQueryService.java`
+**Files:** `LedgerQueryService.java`, `InteractiveQueryRouter.java`
 
-Interactive queries read directly from local RocksDB state stores for
-**sub-millisecond latency** without hitting Kafka brokers.
+Interactive queries read RocksDB state stores directly, without hitting Kafka brokers.
+
+### Routing Across Instances
+
+Each instance only holds the store partitions assigned to it; with N replicas a local-only
+lookup would miss for roughly (N-1)/N of keys. Every instance therefore advertises
+`application.server` (`${APP_ADVERTISED_HOST}:${server.port}` — the pod's stable StatefulSet DNS
+name in k8s), and `InteractiveQueryRouter`:
+
+1. asks Kafka Streams `queryMetadataForKey(store, key)` for the active host;
+2. answers from the local store if that is this instance;
+3. otherwise forwards the HTTP call to the owner, passing the caller's `Authorization` header and
+   an `X-Ledger-IQ-Forwarded` marker. A forwarded request is always answered locally, so a stale
+   view of the assignment during a rebalance cannot cause forwarding loops.
+
+While Kafka Streams is starting, rebalancing or restoring, queries return **`503` with
+`Retry-After`** rather than a `500`. With `application.server` unset (single instance), every
+query is local.
+
+### Endpoints
 
 | Method | Path | Store | Response |
 |--------|------|-------|----------|
-| `POST` | `/api/transactions` | — | Produces `TransactionEvent` |
-| `POST` | `/api/payments` | — | Produces `PaymentEvent` |
+| `POST` | `/api/transactions` | — | `202` after broker ack; `400` invalid; `503` publish failed |
+| `POST` | `/api/payments` | — | `202` after broker ack; `400` invalid; `503` publish failed |
 | `GET` | `/api/ledger/{tenantId}/{accountId}` | `ledger-balance-store` | `BalanceView` |
 | `GET` | `/api/fraud/{tenantId}/{accountId}` | `fraud-activity-store` | `FraudStateView` |
 | `GET` | `/api/payments/{tenantId}/{paymentId}` | `payment-state-store` | `PaymentState` |
-| `GET` | `/api/revenue/{tenantId}?from=&to=` | `revenue-hourly-store` | `List<RevenueWindowEntry>` |
+| `GET` | `/api/revenue/{tenantId}?currency=&from=&to=` | `revenue-hourly-store` | `List<RevenueWindowEntry>` |
 | `GET` | `/api/sync-runs/{syncRunId}` | `sync-runs-merged-store` | `SyncRunMergedRecord` |
 
 ---
@@ -440,14 +507,27 @@ Interactive queries read directly from local RocksDB state stores for
 
 ### Key Convention
 
-All composite keys follow `tenantId|subKey` — e.g. `tenant-a|acct-1` or `tenant-a|pay-1`.
+All composite keys follow `tenantId|subKey` — e.g. `tenant-a|acct-1` or `tenant-a|pay-1` — and
+are partitioned by the default partitioner on the **full** key. Every ID is validated against
+`[A-Za-z0-9._-]{1,64}` (`model/Identifiers`), so no component can contain the `|` delimiter and
+forge another tenant's key.
 
-### TenantAwarePartitioner (`config/TenantAwarePartitioner.java`)
+**Why not partition by tenant alone?** It was considered and rejected: one large tenant would pin
+a single partition — and a single stream thread — while nothing downstream needs cross-account
+ordering within a tenant.
 
-Custom `StreamPartitioner` that hashes **only on `tenantId`**:
-- All accounts for a tenant are co-located on the same partition.
-- KTable joins and aggregations work correctly across sub-keys.
-- Tenant isolation for processing.
+### Tenant Isolation at the API (`security/`)
+
+The service is a stateless OAuth2 resource server (`SecurityConfig`). Every `/api` call needs a
+bearer JWT from the issuer in `spring.security.oauth2.resourceserver.jwt.issuer-uri`, and
+`TenantAccess` requires the token's `tenant_id` claim to match the tenant named in the path or
+body — on writes and reads alike, including queries forwarded between pods. A mismatch is a `403`;
+the tenant in a request is never trusted on its own.
+
+Security is on unless `app.security.enabled=false`. The local `application.yml` sets it to `false`
+(with a startup warning) so the curl examples work without an identity provider; the k8s profile
+turns it on. Sync runs come from a CDC schema without a tenant column, so they require
+authentication but no tenant match.
 
 ### TenantRoutingInterceptor (`config/TenantRoutingInterceptor.java`)
 
@@ -465,6 +545,10 @@ processing.guarantee: exactly_once_v2
 - **No duplicates on rebalance**: new owner replays exactly once.
 - **Fenced zombies**: stale producers are blocked from writing.
 - Critical for ledger balances, payment orchestration, and revenue aggregation.
+
+**What EOS does not cover:** duplicates that arrive from *outside* Kafka — a client retrying a
+POST produces a new record. Business-level idempotency is handled by the ledger's `eventId`
+de-duplication (§4), which is why the ingest API can safely tell clients to retry on `503`.
 
 ---
 
@@ -485,13 +569,30 @@ processing.guarantee: exactly_once_v2
 
 ## 14. Error Handling & Dead Letter Queues
 
+The guiding rule for a ledger: **never drop a record silently.** A record is either applied,
+durably dead-lettered, or processing stops.
+
 | Layer | Handler | Behaviour |
 |-------|---------|-----------|
-| Deserialization | `StreamsDeserializationErrorHandler` | Log + skip |
-| Production | `StreamsProductionExceptionHandler` | Log + continue |
-| Business logic | `PaymentTopologyFactory` DLQ branch | Route to `payment-dlq` |
+| Deserialization | `StreamsDeserializationErrorHandler` | Writes original bytes to `dlq-deserialization-errors`, then skips. If the DLQ write fails → `FAIL` |
+| Production | `StreamsProductionExceptionHandler` | Always `FAIL` — `CONTINUE` would commit the input offset and lose a balance update |
+| Uncaught (any processor) | `StreamsUncaughtExceptionHandler` in `KafkaStreamsConfig` | `SHUTDOWN_CLIENT` — failures are usually deterministic per record, so a replacement thread would loop |
+| Business: invalid payment transition | `PaymentTopologyFactory` branch | `payment-dlq` |
+| Business: currency mismatch | `TransactionGuardProcessor` branch | `ledger-dlq` with `dlq.reason` header |
 
-`DeadLetterQueueHandler.enrichHeaders()` adds `dlq.original.topic`, `dlq.error.message`, `dlq.error.stacktrace` headers.
+`DeadLetterQueueHandler.enrichHeaders()` copies the original headers and adds
+`dlq.original.topic|partition|offset`, `dlq.error.class`, `dlq.error.message` and a truncated
+`dlq.error.stacktrace`.
+
+**Making failures loud:** the `kafkaStreams` health indicator reports `DOWN` once the client is in
+`ERROR`/`NOT_RUNNING` and is part of the liveness and readiness groups, so Kubernetes restarts the
+pod instead of letting it serve HTTP while no longer processing. A deterministic poison record in
+a business topology will therefore crash-loop the pod — deliberately: for a ledger, stopping is
+safer than losing money.
+
+**DLQ delivery is at-least-once.** The DLQ producer is separate from the transactional Streams
+producer, so a crash between the DLQ write and the offset commit can dead-letter the same record
+twice; DLQ consumers should de-duplicate on the `dlq.original.*` coordinates.
 
 ---
 
@@ -507,9 +608,22 @@ processing.guarantee: exactly_once_v2
 ## 16. Observability & Metrics
 
 - **Prometheus** at `/actuator/prometheus` via `micrometer-registry-prometheus`.
-- Custom counters: `ledger_transactions_processed`, `payments_state_transitions`, `fraud_alerts_emitted`, `dlq_records`.
+- **Business counters** (`config/LedgerMetrics`, incremented from the topologies and asserted in
+  the topology tests):
+
+  | Metric | Tags | Incremented when |
+  |--------|------|------------------|
+  | `ledger_transactions_processed_total` | — | A transaction is applied to a balance |
+  | `ledger_transactions_duplicates_total` | — | A replayed `eventId` is dropped |
+  | `payments_state_transitions_total` | `status` | A valid payment transition is emitted |
+  | `fraud_alerts_emitted_total` | `reason` | A fraud alert is emitted |
+  | `dlq_records_total` | `topic` | A record is written to any DLQ |
+
+  Under EOS, an aborted-and-retried transaction can count a record twice: these are operational
+  signals, not reconciliation figures.
 - **Structured logging**: JSON for `k8s`/`prod` profiles, human-readable for `default`.
-- **Health checks**: `/actuator/health` with liveness/readiness probes.
+- **Health checks**: `/actuator/health/liveness` and `/readiness`, both including the
+  `kafkaStreams` indicator (see §14).
 
 ---
 
@@ -517,11 +631,19 @@ processing.guarantee: exactly_once_v2
 
 See `src/main/resources/application.yml` for all settings. Key properties:
 
+- `application-id: kafka-ledger-learning-v2` — bumped because the decimal schemas and repartitioned
+  ledger topology are incompatible with v1 state
 - `processing.guarantee: exactly_once_v2` — EOS
+- `application.server: ${APP_ADVERTISED_HOST:localhost}:${server.port}` — interactive-query routing
 - `rocksdb.config.setter: RocksDbConfig` — custom tuning
 - `default.timestamp.extractor: TransactionEventTimestampExtractor` — event-time
-- `default.deserialization.exception.handler` — poison pill handling
+- `default.deserialization.exception.handler` / `default.production.exception.handler` — see §14
 - `interceptor.classes: TenantRoutingInterceptor` — tenant header enrichment
+- `producer.properties.max.block.ms: 5000`, `delivery.timeout.ms: 15000` — bound how long an API
+  call waits for the broker ack
+- `app.ledger.dedup-window: 7d` — `eventId` de-duplication horizon
+- `app.security.enabled` — JWT auth + tenant isolation (`false` locally, `true` in k8s)
+- `management.endpoint.health.group.{liveness,readiness}.include` — adds `kafkaStreams`
 
 ---
 
@@ -529,7 +651,21 @@ See `src/main/resources/application.yml` for all settings. Key properties:
 
 `k8s/` uses **Kustomize** with base + overlay pattern:
 
-- **Base**: Deployment (3 replicas), Service, ConfigMap, HPA (2–12 pods), ServiceMonitor
+- **Base**:
+  - **StatefulSet** (3 replicas, `podManagementPolicy: Parallel`) with a per-pod
+    `PersistentVolumeClaim` for RocksDB at `/var/kafka-streams`. A restarted pod resumes from its
+    local state instead of replaying every changelog, and keeps a stable identity.
+  - **Headless Service** `kafka-ledger-headless` gives each pod a stable DNS name, advertised as
+    `application.server` via `APP_ADVERTISED_HOST`. `publishNotReadyAddresses: true` keeps peers
+    reachable while restoring.
+  - **ConfigMap** whose `application-k8s.yml` is mounted at `/config/` (picked up through
+    `SPRING_CONFIG_ADDITIONAL_LOCATION`): replication factor 3, 4 stream threads,
+    `num.standby.replicas: 1` for fast failover, JWT security on with the identity-provider
+    `issuer-uri` (a placeholder to replace).
+  - **HPA** on the StatefulSet: CPU only (JVM heap never shrinks, so a memory target blocks
+    scale-down), `maxReplicas: 6` = input partition count, and slow, one-pod-at-a-time scaling in
+    both directions, because every scale event is a rebalance plus state migration.
+  - Service, ServiceMonitor.
 - **Dev overlay**: 1 replica, small resources
 - **Prod overlay**: 3 replicas, PDB (min 2), pod anti-affinity, larger resources
 
@@ -544,7 +680,7 @@ kubectl apply -k k8s/overlays/prod   # Production
 
 ## 19. Terraform (Infrastructure as Code)
 
-`terraform/` provisions all 13 Kafka topics with partition counts, replication, and retention policies.
+`terraform/` provisions all 13 Kafka topics (including `ledger-dlq`) with partition counts, replication, and retention policies.
 
 ```bash
 cd terraform
@@ -556,19 +692,26 @@ terraform apply -var="bootstrap_servers=localhost:9092"
 
 ## 20. Testing Strategy
 
-**17 tests** across 6 test classes using `TopologyTestDriver` (no broker needed):
+**40 tests** across 9 test classes, none of which need a broker:
 
 | Test Class | Tests | Verifies |
 |------------|-------|----------|
-| `LedgerTopologyTest` | 2 | Balance aggregation, fraud alert threshold |
+| `LedgerTopologyTest` | 8 | Balance aggregation, exact decimal arithmetic, `eventId` dedup (and per-tenant scoping), currency mismatch → `ledger-dlq`, fraud threshold, burst detection on historical event time, stream-time eviction via expiry index, metrics |
 | `PaymentStateMachineTest` | 7 | All transitions, reversals, invalid states |
-| `PaymentTopologyTest` | 3 | Full lifecycle, reversal, DLQ routing |
+| `PaymentTopologyTest` | 3 | Full lifecycle, reversal, DLQ routing, metrics |
 | `PaymentWindowedJoinTopologyTest` | 2 | Window match, no-match for different keys |
-| `RevenueAggregationTopologyTest` | 2 | Hourly aggregation, tenant isolation |
+| `RevenueAggregationTopologyTest` | 4 | Hourly aggregation, tenant isolation, per-currency separation, real window bounds from the store |
 | `SyncRunCdcTopologyTest` | 1 | CDC parent + child merge |
+| `MoneyTest` | 5 | Scale normalisation, no rounding, precision limit, ISO currency validation |
+| `StreamsDeserializationErrorHandlerTest` | 2 | Poison pill dead-lettered with diagnostics; `FAIL` when the DLQ write fails |
+| `ApiSecurityAndValidationTest` | 8 | `401` without token, `403` cross-tenant read/write, `202` only after ack, `503` on failed publish, `400` on invalid bodies and unknown commands (`@WebMvcTest`) |
+
+Topology tests use `TopologyTestDriver` with the same event-time `TimestampExtractor` as
+production. Not yet covered: interactive-query forwarding between instances and an end-to-end
+run against a real broker (a Testcontainers integration test is the natural next step).
 
 ```bash
-mvn test   # All 17 tests pass
+mvn test
 ```
 
 ---
@@ -577,13 +720,14 @@ mvn test   # All 17 tests pass
 
 ```
 src/main/avro/                      5 Avro schemas
-src/main/java/.../api/              6 REST controllers
-src/main/java/.../config/           9 configuration classes
-src/main/java/.../model/           12 domain records/POJOs
+src/main/java/.../api/              6 REST controllers + RFC 7807 exception handler
+src/main/java/.../config/           9 classes (Streams/topic config, RocksDB, error handlers, metrics, health)
+src/main/java/.../model/           14 domain records/POJOs + Money/Identifiers rules
+src/main/java/.../security/         2 classes (JWT resource server, tenant access check)
 src/main/java/.../serde/            1 generic JSON serde
-src/main/java/.../streams/         13 topology factories + processors + services
+src/main/java/.../streams/         15 topology factories, processors, query routing
 src/main/resources/                 application.yml + logback-spring.xml
-src/test/java/                      6 test classes (17 tests)
+src/test/java/                      9 test classes (40 tests)
 connect/                            Debezium configs + Postgres init SQL
 k8s/                                Kubernetes manifests (Kustomize)
 terraform/                          Topic provisioning IaC
@@ -600,10 +744,10 @@ docs/                               Documentation collection
 # 1. Start infrastructure
 docker compose up -d
 
-# 2. Build & test (17 tests)
+# 2. Build & test
 mvn clean test
 
-# 3. Run application
+# 3. Run application (local application.yml: security disabled, single instance)
 mvn spring-boot:run
 
 # 4. Submit a transaction
@@ -624,7 +768,14 @@ curl -X POST http://localhost:8080/api/payments \
 curl http://localhost:8080/api/payments/tenant-a/pay-1
 
 # 7. Revenue query
-curl "http://localhost:8080/api/revenue/tenant-a?from=0&to=9999999999999"
+curl "http://localhost:8080/api/revenue/tenant-a?currency=USD&from=0&to=9999999999999"
+
+# 7b. Replaying the same eventId does not change the balance
+curl -X POST http://localhost:8080/api/transactions \
+  -H 'Content-Type: application/json' \
+  -d '{"eventId":"e1","tenantId":"tenant-a","accountId":"acct-1",
+       "amount":1000,"direction":"CREDIT","currency":"USD","eventTime":1710000000000}'
+curl http://localhost:8080/api/ledger/tenant-a/acct-1   # still 1000.0000
 
 # 8. Prometheus metrics
 curl http://localhost:8080/actuator/prometheus | grep -E "ledger|payment|fraud|dlq"

@@ -1,7 +1,9 @@
 package com.example.ledger.streams;
 
 import com.example.ledger.avro.TenantRevenue;
+import com.example.ledger.model.Money;
 import com.example.ledger.model.PaymentState;
+import com.example.ledger.model.RevenueWindowEntry;
 import com.example.ledger.serde.JsonSerde;
 import java.time.Duration;
 import org.apache.kafka.common.serialization.Serde;
@@ -30,7 +32,7 @@ import org.apache.kafka.streams.state.WindowStore;
  *       │
  *       ▼  filter(status == SETTLED)
  *       │
- *       ▼  selectKey → tenantId
+ *       ▼  selectKey → tenantId|currency  (never sum across currencies)
  *       │
  *       ▼  windowedBy(1-hour tumbling)
  *       │
@@ -44,10 +46,30 @@ import org.apache.kafka.streams.state.WindowStore;
  *
  * <p>Demonstrates: tumbling time windows, windowed aggregation,
  * {@link WindowStore} materialisation, windowed interactive queries.
+ *
+ * <p>The aggregator cannot see its window, so the {@code windowStart}/{@code windowEnd} fields
+ * of the <em>stored</em> value are placeholders. They are filled from the windowed key on the
+ * output topic, and from the window-store iterator key by {@link #toWindowEntry} on queries.
  */
 public final class RevenueAggregationTopologyFactory {
 
+    public static final Duration WINDOW_SIZE = Duration.ofHours(1);
+
     private RevenueAggregationTopologyFactory() {
+    }
+
+    public static String revenueKey(String tenantId, String currency) {
+        return tenantId + "|" + currency;
+    }
+
+    /** Builds a query result from a window-store entry; {@code windowStart} is the iterator key. */
+    public static RevenueWindowEntry toWindowEntry(long windowStart, TenantRevenue revenue) {
+        return new RevenueWindowEntry(
+                windowStart,
+                windowStart + WINDOW_SIZE.toMillis(),
+                revenue.getTotalAmount(),
+                revenue.getTransactionCount(),
+                revenue.getCurrency());
     }
 
     public static void build(StreamsBuilder builder,
@@ -60,29 +82,29 @@ public final class RevenueAggregationTopologyFactory {
                 .stream(Topics.PAYMENT_EVENTS, Consumed.with(stringSerde, stateSerde))
                 .filter((key, state) -> state != null && "SETTLED".equals(state.status()),
                         Named.as("revenue-filter-settled"))
-                .selectKey((key, state) -> state.tenantId(),
+                .selectKey((key, state) -> revenueKey(state.tenantId(), state.currency()),
                         Named.as("revenue-rekey-tenant"));
 
         // ── 1-hour tumbling window aggregation ───────────────────────
         KTable<Windowed<String>, TenantRevenue> hourlyRevenue = settled
                 .groupByKey(Grouped.with(stringSerde, stateSerde))
-                .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofHours(1)))
+                .windowedBy(TimeWindows.ofSizeWithNoGrace(WINDOW_SIZE))
                 .aggregate(
                         () -> TenantRevenue.newBuilder()
                                 .setTenantId("unknown")
                                 .setWindowStart(0L)
                                 .setWindowEnd(0L)
-                                .setTotalAmount(0.0)
+                                .setTotalAmount(Money.ZERO)
                                 .setTransactionCount(0L)
-                                .setCurrency("USD")
+                                .setCurrency(Money.DEFAULT_CURRENCY)
                                 .build(),
-                        (tenantId, payment, aggregate) -> TenantRevenue.newBuilder()
-                                .setTenantId(tenantId)
+                        (revenueKey, payment, aggregate) -> TenantRevenue.newBuilder()
+                                .setTenantId(payment.tenantId())
                                 .setWindowStart(0L) // set from windowed key below
                                 .setWindowEnd(0L)
-                                .setTotalAmount(aggregate.getTotalAmount() + payment.amount())
+                                .setTotalAmount(Money.normalize(aggregate.getTotalAmount().add(payment.amount())))
                                 .setTransactionCount(aggregate.getTransactionCount() + 1)
-                                .setCurrency(payment.currency() != null ? payment.currency() : "USD")
+                                .setCurrency(payment.currency())
                                 .build(),
                         Materialized.<String, TenantRevenue, WindowStore<Bytes, byte[]>>as(Topics.REVENUE_STORE)
                                 .withKeySerde(stringSerde)

@@ -1,6 +1,7 @@
 package com.example.ledger.streams;
 
 import com.example.ledger.avro.PaymentEvent;
+import com.example.ledger.config.LedgerMetrics;
 import com.example.ledger.model.PaymentState;
 import com.example.ledger.serde.JsonSerde;
 import org.apache.kafka.common.serialization.Serde;
@@ -42,7 +43,8 @@ public final class PaymentTopologyFactory {
     }
 
     public static KStream<String, PaymentState> build(StreamsBuilder builder,
-                                                       Serde<PaymentEvent> paymentEventSerde) {
+                                                       Serde<PaymentEvent> paymentEventSerde,
+                                                       LedgerMetrics metrics) {
         Serde<String> stringSerde = Serdes.String();
         JsonSerde<PaymentState> paymentStateSerde = new JsonSerde<>(PaymentState.class);
 
@@ -69,12 +71,14 @@ public final class PaymentTopologyFactory {
         stateChanges
                 .filter((key, state) -> state != null && state.failReason() == null,
                         Named.as("payment-success-filter"))
+                .peek((key, state) -> metrics.paymentTransition(state.status()))
                 .to(Topics.PAYMENT_EVENTS, Produced.with(stringSerde, paymentStateSerde));
 
         // ── Failed transitions → payment-dlq ─────────────────────────
         stateChanges
                 .filter((key, state) -> state != null && state.failReason() != null,
                         Named.as("payment-dlq-filter"))
+                .peek((key, state) -> metrics.deadLettered(Topics.PAYMENT_DLQ))
                 .to(Topics.PAYMENT_DLQ, Produced.with(stringSerde, paymentStateSerde));
 
         return stateChanges;

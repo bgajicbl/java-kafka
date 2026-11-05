@@ -7,7 +7,7 @@
     { "name": "paymentId", "type": "string" },
     { "name": "tenantId", "type": "string" },
     { "name": "accountId", "type": "string" },
-    { "name": "amount", "type": "double" },
+    { "name": "amount", "type": { "type": "bytes", "logicalType": "decimal", "precision": 19, "scale": 4 } },
     { "name": "currency", "type": "string", "default": "USD" },
     { "name": "commandType", "type": {
       "type": "enum",

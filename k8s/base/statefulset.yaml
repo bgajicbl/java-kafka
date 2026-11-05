@@ -1,11 +1,18 @@
+# StatefulSet, not Deployment: Kafka Streams instances are stateful.
+#  - Stable pod identity → stable application.server address for interactive-query routing.
+#  - Per-pod PersistentVolume for RocksDB → a restarted pod resumes from its local state
+#    instead of replaying every changelog topic from the beginning.
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: kafka-ledger-app
   labels:
     app: kafka-ledger
 spec:
+  serviceName: kafka-ledger-headless
   replicas: 3
+  # Streams instances don't depend on each other's startup order
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: kafka-ledger
@@ -28,6 +35,19 @@ spec:
           env:
             - name: SPRING_PROFILES_ACTIVE
               value: "k8s"
+            - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+              value: "optional:file:/config/"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Advertised to peers as application.server for interactive-query routing
+            - name: APP_ADVERTISED_HOST
+              value: "$(POD_NAME).kafka-ledger-headless.$(POD_NAMESPACE).svc.cluster.local"
             - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
                 configMapKeyRef:
@@ -41,6 +61,9 @@ spec:
           volumeMounts:
             - name: state-store
               mountPath: /var/kafka-streams
+            - name: app-config
+              mountPath: /config
+              readOnly: true
           resources:
             requests:
               memory: "512Mi"
@@ -63,6 +86,17 @@ spec:
             periodSeconds: 5
             failureThreshold: 3
       volumes:
-        - name: state-store
-          emptyDir: {}
-
+        - name: app-config
+          configMap:
+            name: kafka-ledger-config
+            items:
+              - key: application-k8s.yml
+                path: application-k8s.yml
+  volumeClaimTemplates:
+    - metadata:
+        name: state-store
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

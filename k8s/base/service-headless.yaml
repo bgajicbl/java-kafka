@@ -1,0 +1,20 @@
+# Headless service: gives each StatefulSet pod a stable DNS name
+# (<pod>.kafka-ledger-headless.<ns>.svc.cluster.local) that instances advertise as
+# application.server, so a query landing on the wrong pod is forwarded to the key's owner.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-ledger-headless
+  labels:
+    app: kafka-ledger
+spec:
+  clusterIP: None
+  # Peers must be reachable while restoring, before they report ready
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka-ledger
+  ports:
+    - port: 8080
+      targetPort: http
+      protocol: TCP
+      name: http

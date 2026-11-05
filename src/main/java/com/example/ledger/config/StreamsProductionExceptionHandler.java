@@ -8,10 +8,14 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Kafka Streams {@link ProductionExceptionHandler} for producer-side errors
- * (e.g., serialisation failures, record-too-large).
+ * (e.g. record-too-large, authorization failures).
  *
- * <p>Logs the error and continues processing. In production, integrate with
- * alerting systems (PagerDuty, Opsgenie) and consider routing to a DLQ.
+ * <p>Always {@code FAIL}s. The record that failed to produce is a balance update, a payment
+ * state change or a fraud alert; returning {@code CONTINUE} would commit the input offset
+ * and silently lose it, leaving the ledger inconsistent with its changelog. Failing stops
+ * the stream thread; {@code KafkaStreamsConfig} then shuts the client down and the
+ * {@code kafkaStreams} health indicator takes the pod out of service, so the incident is
+ * loud and processing resumes from the last committed transaction once fixed.
  *
  * <p>Register via
  * {@code spring.kafka.streams.properties.default.production.exception.handler}.
@@ -22,15 +26,14 @@ public class StreamsProductionExceptionHandler implements ProductionExceptionHan
 
     @Override
     public ProductionExceptionHandlerResponse handle(ProducerRecord<byte[], byte[]> record,
-                                                      Exception exception) {
-        log.error("Production error – topic={}, partition={}, keySize={}: {}",
+                                                     Exception exception) {
+        log.error("Production error – topic={}, partition={}, keySize={}, valueSize={}; failing the stream thread",
                 record.topic(),
                 record.partition(),
                 record.key() != null ? record.key().length : 0,
-                exception.getMessage(),
+                record.value() != null ? record.value().length : 0,
                 exception);
-
-        return ProductionExceptionHandlerResponse.CONTINUE;
+        return ProductionExceptionHandlerResponse.FAIL;
     }
 
     @Override
@@ -38,4 +41,3 @@ public class StreamsProductionExceptionHandler implements ProductionExceptionHan
         // No configuration needed
     }
 }
-

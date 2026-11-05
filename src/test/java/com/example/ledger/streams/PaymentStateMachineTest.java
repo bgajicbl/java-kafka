@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.example.ledger.avro.PaymentCommandType;
 import com.example.ledger.avro.PaymentEvent;
 import com.example.ledger.model.PaymentState;
+import java.math.BigDecimal;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -96,7 +97,7 @@ class PaymentStateMachineTest {
                 .setPaymentId("pay-1")
                 .setTenantId("tenant-a")
                 .setAccountId("acct-1")
-                .setAmount(100.0)
+                .setAmount(new BigDecimal("100.0000"))
                 .setCurrency("USD")
                 .setCommandType(type)
                 .setCorrelationId(null)
